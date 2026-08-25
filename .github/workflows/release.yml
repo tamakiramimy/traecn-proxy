@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Publish ${{ matrix.rid }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        rid:
+          - osx-x64
+          - osx-arm64
+          - win-x64
+          - win-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Publish self-contained executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          output="publish/${{ matrix.rid }}"
+          archive="trancn-proxy-${GITHUB_REF_NAME}-${{ matrix.rid }}.zip"
+
+          dotnet publish TrancnProxy.csproj \
+            --configuration Release \
+            --runtime "${{ matrix.rid }}" \
+            --self-contained true \
+            --output "$output" \
+            -p:Version="$version" \
+            -p:ContinuousIntegrationBuild=true \
+            -p:DebugType=None \
+            -p:DebugSymbols=false \
+            -p:PublishTrimmed=false
+
+          mkdir -p dist
+          (
+            cd "$output"
+            zip -q -r "../../dist/$archive" .
+          )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.rid }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Create GitHub Release
+    needs: publish
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: Create release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release/*.zip

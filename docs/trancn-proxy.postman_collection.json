@@ -1,0 +1,90 @@
+{
+  "info": {
+    "name": "trancn-proxy 验证",
+    "description": "Trae CN -> OpenAI/Anthropic 兼容代理验证集合",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://127.0.0.1:9220" },
+    { "key": "api_key", "value": "test-key-123" }
+  ],
+  "item": [
+    {
+      "name": "状态",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "Authorization", "value": "Bearer {{api_key}}" }],
+        "url": { "raw": "{{base_url}}/v1/status", "host": ["{{base_url}}"], "path": ["v1", "status"] }
+      }
+    },
+    {
+      "name": "模型列表",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "Authorization", "value": "Bearer {{api_key}}" }],
+        "url": { "raw": "{{base_url}}/v1/models", "host": ["{{base_url}}"], "path": ["v1", "models"] }
+      }
+    },
+    {
+      "name": "OpenAI ChatCompletions",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{api_key}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"model\": \"glm-5.2__max\",\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"你好,请用一句话介绍你自己\" }\n  ]\n}"
+        },
+        "url": { "raw": "{{base_url}}/v1/chat/completions", "host": ["{{base_url}}"], "path": ["v1", "chat", "completions"] }
+      }
+    },
+    {
+      "name": "OpenAI ChatCompletions 流式",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{api_key}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"model\": \"glm-5.2__max\",\n  \"stream\": true,\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"回复:OK\" }\n  ]\n}"
+        },
+        "url": { "raw": "{{base_url}}/v1/chat/completions", "host": ["{{base_url}}"], "path": ["v1", "chat", "completions"] }
+      }
+    },
+    {
+      "name": "Anthropic Messages",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{api_key}}" },
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "anthropic-version", "value": "2023-06-01" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"model\": \"glm-5.2__max\",\n  \"max_tokens\": 200,\n  \"messages\": [\n    { \"role\": \"user\", \"content\": \"你好,介绍一下你自己\" }\n  ]\n}"
+        },
+        "url": { "raw": "{{base_url}}/v1/messages", "host": ["{{base_url}}"], "path": ["v1", "messages"] }
+      }
+    },
+    {
+      "name": "OpenAI Responses",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{api_key}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"model\": \"glm-5.2__max\",\n  \"input\": \"你好,回复:收到\"\n}"
+        },
+        "url": { "raw": "{{base_url}}/v1/responses", "host": ["{{base_url}}"], "path": ["v1", "responses"] }
+      }
+    }
+  ]
+}
