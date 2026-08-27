@@ -112,10 +112,10 @@ internal sealed class TraeAccountRuntime
 {
     private int _inFlight;
 
-    public TraeAccountRuntime(TraeAccount account)
+    public TraeAccountRuntime(TraeAccount account, string? chatApiHost)
     {
         Account = account;
-        Client = new TraeClient(account.Auth, account.DeviceId, account.MachineId);
+        Client = new TraeClient(account.Auth, account.DeviceId, account.MachineId, chatApiHost: chatApiHost);
     }
 
     public TraeAccount Account { get; }
@@ -143,16 +143,18 @@ internal sealed class TraeAccountRuntime
 public sealed class MultiAccountManager
 {
     private readonly TraeAccountStore _store;
+    private readonly string? _chatApiHost;
     private readonly object _selectionGate = new();
     private readonly ConcurrentDictionary<string, TraeAccountRuntime> _accounts = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, SessionBinding> _sessions = new(StringComparer.Ordinal);
 
-    public MultiAccountManager(TraeAccountStore store)
+    public MultiAccountManager(TraeAccountStore store, string? chatApiHost = null)
     {
         _store = store;
+        _chatApiHost = chatApiHost;
         Settings = store.LoadOrMigrate();
         foreach (var account in Settings.Accounts)
-            _accounts[account.Id] = new TraeAccountRuntime(account);
+            _accounts[account.Id] = new TraeAccountRuntime(account, _chatApiHost);
     }
 
     public MultiAccountSettings Settings { get; private set; }
@@ -172,7 +174,7 @@ public sealed class MultiAccountManager
                 throw new InvalidOperationException($"账号别名 '{account.Alias}' 已存在。");
 
             if (string.IsNullOrWhiteSpace(account.Id)) account.Id = Guid.NewGuid().ToString("N");
-            _accounts[account.Id] = new TraeAccountRuntime(account);
+            _accounts[account.Id] = new TraeAccountRuntime(account, _chatApiHost);
             Settings.Accounts = _accounts.Values.Select(x => x.Account).OrderBy(x => x.Alias).ToList();
             _store.Save(Settings);
             return account;
@@ -266,7 +268,7 @@ public sealed class MultiAccountManager
         foreach (var account in settings.Accounts)
             if (string.IsNullOrWhiteSpace(account.Id)) account.Id = Guid.NewGuid().ToString("N");
         settings.Accounts = settings.Accounts.OrderBy(x => x.Alias).ToList();
-        var runtimes = settings.Accounts.Select(account => new TraeAccountRuntime(account)).ToList();
+        var runtimes = settings.Accounts.Select(account => new TraeAccountRuntime(account, _chatApiHost)).ToList();
 
         lock (_selectionGate)
         {

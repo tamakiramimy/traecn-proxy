@@ -7,6 +7,7 @@ public sealed class ProxySettings
     public ServerSettings Server { get; set; } = new();
     public SecuritySettings Security { get; set; } = new();
     public AccountSettings Accounts { get; set; } = new();
+    public UpstreamSettings Upstream { get; set; } = new();
     public IdeBridgeSettings IdeBridge { get; set; } = new();
 
     public static ProxySettings Load()
@@ -45,6 +46,11 @@ public sealed class ProxySettings
     public sealed class AccountSettings
     {
         public string? DataDirectory { get; set; }
+    }
+
+    public sealed class UpstreamSettings
+    {
+        public string? ChatApiHost { get; set; }
     }
 
     public sealed class IdeBridgeSettings

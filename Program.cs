@@ -12,6 +12,7 @@ var argsList = args.ToList();
 bool forceLogin = argsList.Remove("--login");
 bool webLogin = argsList.Remove("--weblogin");
 bool testMode = argsList.Remove("--test");
+bool listChatModels = argsList.Remove("--chat-models");
 bool listAccounts = argsList.Remove("--account-list");
 var settings = ProxySettings.Load();
 int port = settings.Server.Port;
@@ -24,6 +25,7 @@ string? dataDirectory = EmptyToNull(settings.Accounts.DataDirectory);
 string? importPath = null;
 string? publicBaseUrl = Environment.GetEnvironmentVariable("TRANCN_PUBLIC_BASE_URL") ?? EmptyToNull(settings.Server.PublicBaseUrl);
 string? protocolEvidenceDirectory = null;
+string? chatApiHost = Environment.GetEnvironmentVariable("TRANCN_CHAT_API_HOST") ?? EmptyToNull(settings.Upstream.ChatApiHost);
 for (int i = 0; i < argsList.Count; i++)
 {
     if (argsList[i] == "--port" && i + 1 < argsList.Count) port = int.Parse(argsList[++i]);
@@ -35,6 +37,7 @@ for (int i = 0; i < argsList.Count; i++)
     else if (argsList[i] == "--account-import" && i + 1 < argsList.Count) importPath = argsList[++i];
     else if (argsList[i] == "--public-base-url" && i + 1 < argsList.Count) publicBaseUrl = argsList[++i];
     else if (argsList[i] == "--protocol-evidence-dir" && i + 1 < argsList.Count) protocolEvidenceDirectory = argsList[++i];
+    else if (argsList[i] == "--chat-api-host" && i + 1 < argsList.Count) chatApiHost = argsList[++i];
 }
 
 if (!string.IsNullOrWhiteSpace(protocolEvidenceDirectory) && IsWithinCurrentWorkspace(protocolEvidenceDirectory))
@@ -76,7 +79,7 @@ catch (InvalidOperationException ex)
 using (instanceLock)
 {
 var accountStore = new TraeAccountStore(dataDirectory);
-var accountManager = new MultiAccountManager(accountStore);
+var accountManager = new MultiAccountManager(accountStore, chatApiHost);
 var oauthLogins = new TraeOAuthLoginManager();
 if (!string.IsNullOrWhiteSpace(importPath))
 {
@@ -123,6 +126,15 @@ if (listAccounts)
 
 Console.WriteLine($"账号池就绪: {accountManager.Accounts.Count} 个账号");
 
+if (listChatModels)
+{
+    using var modelLease = accountManager.AcquireByAlias(accountAlias);
+    Console.WriteLine($"--- chat 服务面模型表: {modelLease.Client.ChatApiHost} ---");
+    foreach (var (configName, modelNames) in await modelLease.Client.GetChatModelConfigsAsync())
+        Console.WriteLine(modelNames.Count == 0 ? configName : $"{configName}  ({string.Join(", ", modelNames)})");
+    return 0;
+}
+
 // ---------- 2. 自测模式 ----------
 if (testMode)
 {
@@ -145,6 +157,17 @@ if (testMode)
         {
             var j = JsonNode.Parse(ev.Data) as JsonObject;
             Console.WriteLine($"\n[usage] prompt={j?["prompt_tokens"]} completion={j?["completion_tokens"]} total={j?["total_tokens"]}");
+        }
+        else if (ev.Event == "error")
+        {
+            var payload = JsonNode.Parse(ev.Data) as JsonObject;
+            Console.WriteLine($"[error] code={payload?["code"]}");
+        }
+        else
+        {
+            var payload = JsonNode.Parse(ev.Data) as JsonObject;
+            string keys = payload is null ? "non-json" : string.Join(',', payload.Select(entry => entry.Key));
+            Console.WriteLine($"[{ev.Event}] fields={keys}");
         }
     }
     Console.WriteLine();

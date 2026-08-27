@@ -20,11 +20,17 @@ public class TraeClient
     public const string DefaultAppId = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
     public const string DefaultClientId = "ono9krqynydwx5";
     public const int AppVersionCode = 20260806;
+    // 独立 chat 服务面只接受 SOLO 客户端画像与 solo_work_lite 通道，与企业控制面不通用。
+    private const string SoloIdeVersion = "0.1.43";
+    private const string SoloIdeVersionCode = "20260716";
+    private const string SoloChatFunction = "solo_work_lite";
     // The current enterprise chat endpoint always selects this tenant default model.
     public const string DefaultChatModel = "Doubao-Seed-Evolving";
 
     private readonly HttpClient _http;
     private readonly string _apiHost;
+    private readonly string _chatApiHost;
+    private readonly bool _usesExternalChatApiHost;
     private readonly string _deviceId;
     private readonly string _machineId;
     private readonly TraeAuthData _auth;
@@ -34,10 +40,13 @@ public class TraeClient
         TraeAuthData auth,
         string? deviceId = null,
         string? machineId = null,
-        HttpMessageHandler? httpMessageHandler = null)
+        HttpMessageHandler? httpMessageHandler = null,
+        string? chatApiHost = null)
     {
         _auth = auth;
         _apiHost = string.IsNullOrWhiteSpace(auth.ApiHost) ? "https://console.enterprise.trae.cn" : auth.ApiHost!;
+        _chatApiHost = string.IsNullOrWhiteSpace(chatApiHost) ? _apiHost : chatApiHost.TrimEnd('/');
+        _usesExternalChatApiHost = !string.Equals(_apiHost, _chatApiHost, StringComparison.OrdinalIgnoreCase);
         (_deviceId, _machineId) = (deviceId ?? "0", machineId ?? "0");
         _http = httpMessageHandler is null
             ? BuildHttpClient()
@@ -46,6 +55,7 @@ public class TraeClient
     }
 
     public string ApiHost => _apiHost;
+    public string ChatApiHost => _chatApiHost;
 
     /// <summary>Sends a JSON request with the authenticated TRAE client headers and proxy configuration.</summary>
     public Task<HttpResponseMessage> SendJsonAsync(
@@ -78,28 +88,47 @@ public class TraeClient
         return new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(10) };
     }
 
-    private void AddHeaders(HttpRequestMessage req)
+    private void AddHeaders(HttpRequestMessage req, bool useSoloChatProfile = false, bool streaming = true)
     {
         var h = req.Headers;
         h.TryAddWithoutValidation("Authorization", $"Cloud-IDE-JWT {_auth.Token}");
         h.TryAddWithoutValidation("x-cloudide-token", _auth.Token);
         h.TryAddWithoutValidation("x-app-id", DefaultAppId);
-        h.TryAddWithoutValidation("x-app-version", "default");
-        h.TryAddWithoutValidation("x-app-version-code", AppVersionCode.ToString());
-        h.TryAddWithoutValidation("x-device-id", _deviceId);
-        h.TryAddWithoutValidation("x-machine-id", _machineId);
-        h.TryAddWithoutValidation("x-device-type", OperatingSystem.IsMacOS() ? "mac" : OperatingSystem.IsWindows() ? "windows" : "linux");
-        h.TryAddWithoutValidation("x-device-brand", DeviceBrand());
-        h.TryAddWithoutValidation("x-device-cpu", OperatingSystem.IsMacOS() ? "Apple" : "Unknown");
-        h.TryAddWithoutValidation("x-os-version", OsVersion());
-        h.TryAddWithoutValidation("x-ide-version", "3.3.87");
-        h.TryAddWithoutValidation("x-ide-version-code", AppVersionCode.ToString());
-        h.TryAddWithoutValidation("x-ide-version-type", "stable");
-        h.TryAddWithoutValidation("request-traffic-type", "prod");
+        if (useSoloChatProfile)
+        {
+            h.TryAddWithoutValidation("x-ide-token", _auth.Token);
+            h.TryAddWithoutValidation("User-Agent", $"Trae/{SoloIdeVersion}");
+            h.TryAddWithoutValidation("x-app-version", "default");
+            h.TryAddWithoutValidation("x-app-version-code", SoloIdeVersionCode);
+            h.TryAddWithoutValidation("x-ide-version", SoloIdeVersion);
+            h.TryAddWithoutValidation("x-ide-version-code", SoloIdeVersionCode);
+            h.TryAddWithoutValidation("x-ide-version-type", "stable");
+            h.TryAddWithoutValidation("x-device-type", "windows");
+            h.TryAddWithoutValidation("x-os-version", "Windows 11 Pro");
+            h.TryAddWithoutValidation("x-device-brand", "83DG");
+            h.TryAddWithoutValidation("request-traffic-type", "prod");
+            h.TryAddWithoutValidation("x-device-id", _deviceId);
+            h.TryAddWithoutValidation("x-machine-id", _machineId);
+        }
+        else
+        {
+            h.TryAddWithoutValidation("x-app-version", "default");
+            h.TryAddWithoutValidation("x-app-version-code", AppVersionCode.ToString());
+            h.TryAddWithoutValidation("x-device-id", _deviceId);
+            h.TryAddWithoutValidation("x-machine-id", _machineId);
+            h.TryAddWithoutValidation("x-device-type", OperatingSystem.IsMacOS() ? "mac" : OperatingSystem.IsWindows() ? "windows" : "linux");
+            h.TryAddWithoutValidation("x-os-version", OsVersion());
+            h.TryAddWithoutValidation("x-ide-version", "3.3.87");
+            h.TryAddWithoutValidation("x-ide-version-code", AppVersionCode.ToString());
+            h.TryAddWithoutValidation("x-device-brand", DeviceBrand());
+            h.TryAddWithoutValidation("x-device-cpu", OperatingSystem.IsMacOS() ? "Apple" : "Unknown");
+            h.TryAddWithoutValidation("x-ide-version-type", "stable");
+            h.TryAddWithoutValidation("request-traffic-type", "prod");
+        }
         h.TryAddWithoutValidation("x-request-id", Guid.NewGuid().ToString());
         if (!string.IsNullOrEmpty(_auth.UserId))
             h.TryAddWithoutValidation("x-uid", _auth.UserId);
-        req.Headers.Accept.TryParseAdd("text/event-stream");
+        req.Headers.Accept.TryParseAdd(streaming ? "text/event-stream" : "application/json");
     }
 
     private static string DeviceBrand()
@@ -173,6 +202,51 @@ public class TraeClient
         return ChatStreamCore(messages, model, ct);
     }
 
+    /// <summary>Lists the model config names selectable on the configured chat service.</summary>
+    /// <param name="ct">Cancels the request.</param>
+    /// <returns>Config names paired with their nested model names.</returns>
+    public async Task<IReadOnlyList<(string ConfigName, IReadOnlyList<string> ModelNames)>> GetChatModelConfigsAsync(
+        CancellationToken ct = default)
+    {
+        var body = new JsonObject
+        {
+            ["function"] = _usesExternalChatApiHost ? SoloChatFunction : "inline_chat",
+            ["config_names"] = null,
+            ["need_prompt"] = false,
+            ["current_config_info"] = null,
+            ["poly_prompt"] = true,
+            ["mode_type"] = null,
+            ["agent_type"] = null
+        };
+        var req = new HttpRequestMessage(HttpMethod.Post, $"{_chatApiHost}/api/ide/v1/get_detail_param");
+        AddHeaders(req, _usesExternalChatApiHost, streaming: false);
+        req.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
+        using var resp = await _http.SendAsync(req, ct);
+        string raw = await resp.Content.ReadAsStringAsync(ct);
+        if (!resp.IsSuccessStatusCode)
+            throw new InvalidOperationException($"get_detail_param {resp.StatusCode}: {Truncate(raw, 300)}");
+
+        var root = JsonNode.Parse(raw) as JsonObject
+            ?? throw new TraeModelCatalogException("get_detail_param response is empty.");
+        var configs = (root["config_info_list"] ?? root["Result"]?["config_info_list"] ?? root["data"]?["config_info_list"]) as JsonArray
+            ?? throw new TraeModelCatalogException($"get_detail_param response has no config_info_list: {Truncate(raw, 300)}");
+
+        var results = new List<(string, IReadOnlyList<string>)>();
+        foreach (var entry in configs.OfType<JsonObject>())
+        {
+            string? configName = (string?)entry["config_name"];
+            if (string.IsNullOrWhiteSpace(configName)) continue;
+            var modelNames = (entry["model_detail_list"] as JsonArray)?
+                .OfType<JsonObject>()
+                .Select(model => (string?)model["model_name"])
+                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .Select(name => name!)
+                .ToArray() ?? [];
+            results.Add((configName!, modelNames));
+        }
+        return results;
+    }
+
     private async IAsyncEnumerable<TraeSseEvent> ChatStreamCore(
         IEnumerable<(string role, string text)> messages, string model, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
@@ -189,15 +263,16 @@ public class TraeClient
         {
             ["messages"] = msgList,
             ["model"] = model,
-            ["function"] = "inline_chat",
+            ["function"] = _usesExternalChatApiHost ? SoloChatFunction : "inline_chat",
             ["stream"] = true,
-            ["request_id"] = Guid.NewGuid().ToString(),
-            ["session_id"] = sessionId,
-            ["app_version_code"] = AppVersionCode
+            ["request_id"] = sessionId,
+            ["session_id"] = sessionId
         };
+        if (_usesExternalChatApiHost)
+            body["config_name"] = model;
 
-        var req = new HttpRequestMessage(HttpMethod.Post, $"{_apiHost}/api/agent/v3/llm_utils_chat");
-        AddHeaders(req);
+        var req = new HttpRequestMessage(HttpMethod.Post, $"{_chatApiHost}/api/agent/v3/llm_utils_chat");
+        AddHeaders(req, _usesExternalChatApiHost);
         req.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
 
         using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
