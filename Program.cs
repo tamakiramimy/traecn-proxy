@@ -23,6 +23,12 @@ string accountAlias = "default";
 string? dataDirectory = EmptyToNull(settings.Accounts.DataDirectory);
 string? importPath = null;
 string? publicBaseUrl = Environment.GetEnvironmentVariable("TRANCN_PUBLIC_BASE_URL") ?? EmptyToNull(settings.Server.PublicBaseUrl);
+var ideBridge = settings.IdeBridge.Enabled
+    ? new TraeIdeBridge(
+        settings.IdeBridge.DebugEndpoint,
+        TimeSpan.FromSeconds(Math.Max(1, settings.IdeBridge.RequestTimeoutSeconds)),
+        TimeSpan.FromMilliseconds(Math.Max(10, settings.IdeBridge.PollIntervalMilliseconds)))
+    : null;
 for (int i = 0; i < argsList.Count; i++)
 {
     if (argsList[i] == "--port" && i + 1 < argsList.Count) port = int.Parse(argsList[++i]);
@@ -146,6 +152,32 @@ app.UseStaticFiles();
 
 app.Use(async (ctx, next) =>
 {
+    try
+    {
+        await next();
+    }
+    catch (TraeModelSelectionException ex) when (!ctx.Response.HasStarted)
+    {
+        ctx.Response.Clear();
+        ctx.Response.StatusCode = StatusCodes.Status502BadGateway;
+        await ctx.Response.WriteAsJsonAsync(new
+        {
+            error = new { message = ex.Message, type = "upstream_error", code = "model_selection_mismatch" }
+        });
+    }
+    catch (TraeIdeBridgeException ex) when (!ctx.Response.HasStarted)
+    {
+        ctx.Response.Clear();
+        ctx.Response.StatusCode = StatusCodes.Status502BadGateway;
+        await ctx.Response.WriteAsJsonAsync(new
+        {
+            error = new { message = ex.Message, type = "upstream_error", code = "ide_bridge_error" }
+        });
+    }
+});
+
+app.Use(async (ctx, next) =>
+{
     bool isBusinessApi = ctx.Request.Path.StartsWithSegments("/v1");
     bool isAdminApi = ctx.Request.Path.StartsWithSegments("/admin/api");
     if ((isBusinessApi && !string.IsNullOrEmpty(gatewayKey)) || (isAdminApi && !string.IsNullOrEmpty(adminKey)))
@@ -168,9 +200,15 @@ app.Use(async (ctx, next) =>
     await next();
 });
 
-app.MapGet("/v1/status", () => new
+app.MapGet("/v1/status", async (CancellationToken ct) => new
 {
     ok = true,
+    ide_bridge = new
+    {
+        enabled = ideBridge is not null,
+        available = ideBridge is not null && await ideBridge.IsAvailableAsync(ct),
+        account_scope = "current_trae_ide_account"
+    },
     accounts = accountManager.Accounts.Select(x => new
     {
         alias = x.Alias,
@@ -182,19 +220,30 @@ app.MapGet("/v1/status", () => new
     })
 });
 
-app.MapGet("/v1/models", () =>
+app.MapGet("/v1/models", async (CancellationToken ct) =>
 {
-    var model = TraeClient.DefaultChatModel;
-    return Results.Json(new JsonObject
+    try
     {
-        ["object"] = "list",
-        ["data"] = new JsonArray(new JsonObject
+        using var lease = accountManager.Acquire(null);
+        var catalog = await lease.Client.GetModelCatalogAsync(ct: ct);
+        return Results.Json(new JsonObject
         {
-            ["id"] = model,
-            ["display_name"] = model,
-            ["owned_by"] = "trae"
-        })
-    });
+            ["object"] = "list",
+            ["data"] = new JsonArray(catalog.Models.Select(model => (JsonNode)new JsonObject
+            {
+                ["id"] = model.Id,
+                ["object"] = "model",
+                ["display_name"] = model.DisplayName,
+                ["config_name"] = model.ConfigName,
+                ["variant"] = model.Variant.ToString().ToLowerInvariant(),
+                ["owned_by"] = "trae"
+            }).ToArray())
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Json(new { error = new { message = ex.Message, type = "upstream_error" } }, statusCode: 502);
+    }
 });
 
 app.MapPost("/v1/chat/completions", async (HttpContext ctx) =>
@@ -202,14 +251,17 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx) =>
     var ct = ctx.RequestAborted;
     var body = JsonNode.Parse(await new StreamReader(ctx.Request.Body).ReadToEndAsync(ct))!.AsObject();
     string model = (string?)body["model"] ?? TraeClient.DefaultChatModel;
-    if (!IsSupportedModel(model)) return UnsupportedModel(model);
     bool stream = body["stream"] is JsonValue sv && sv.TryGetValue<bool>(out var sb) && sb;
     var messages = ConvertOpenAIMessages(body["messages"]?.AsArray());
     if (messages.Count == 0)
         return Results.BadRequest(new { error = new { message = "messages is required", type = "invalid_request_error" } });
 
     using var lease = accountManager.Acquire(SessionKey(ctx, body));
-    var upstream = lease.Client.ChatStreamAsync(messages, model, ct);
+    TraeModelDescriptor descriptor;
+    try { descriptor = await lease.Client.ResolveModelAsync(model, ct); }
+    catch (TraeModelNotFoundException) { return UnsupportedModel(model); }
+    if (ideBridge is null) return IdeBridgeDisabled();
+    var upstream = ideBridge.ChatStreamAsync(messages, descriptor, ct);
     if (stream)
     {
         ctx.Response.ContentType = "text/event-stream";
@@ -225,14 +277,17 @@ app.MapPost("/v1/responses", async (HttpContext ctx) =>
     var ct = ctx.RequestAborted;
     var body = JsonNode.Parse(await new StreamReader(ctx.Request.Body).ReadToEndAsync(ct))!.AsObject();
     string model = (string?)body["model"] ?? TraeClient.DefaultChatModel;
-    if (!IsSupportedModel(model)) return UnsupportedModel(model);
     bool stream = body["stream"] is JsonValue sv && sv.TryGetValue<bool>(out var sb) && sb;
     var messages = ConvertResponsesInput(body["input"]);
     if (messages.Count == 0)
         return Results.BadRequest(new { error = new { message = "input is required", type = "invalid_request_error" } });
 
     using var lease = accountManager.Acquire(SessionKey(ctx, body));
-    var upstream = lease.Client.ChatStreamAsync(messages, model, ct);
+    TraeModelDescriptor descriptor;
+    try { descriptor = await lease.Client.ResolveModelAsync(model, ct); }
+    catch (TraeModelNotFoundException) { return UnsupportedModel(model); }
+    if (ideBridge is null) return IdeBridgeDisabled();
+    var upstream = ideBridge.ChatStreamAsync(messages, descriptor, ct);
     string respId = $"resp_{Guid.NewGuid():N}";
     if (stream)
     {
@@ -248,14 +303,17 @@ app.MapPost("/v1/messages", async (HttpContext ctx) =>
     var ct = ctx.RequestAborted;
     var body = JsonNode.Parse(await new StreamReader(ctx.Request.Body).ReadToEndAsync(ct))!.AsObject();
     string model = (string?)body["model"] ?? TraeClient.DefaultChatModel;
-    if (!IsSupportedModel(model)) return UnsupportedModel(model);
     bool stream = body["stream"] is JsonValue sv && sv.TryGetValue<bool>(out var sb) && sb;
     var messages = ConvertAnthropicMessages(body);
     if (messages.Count == 0)
         return Results.BadRequest(new { type = "error", error = new { message = "messages is required", type = "invalid_request_error" } });
 
     using var lease = accountManager.Acquire(SessionKey(ctx, body));
-    var upstream = lease.Client.ChatStreamAsync(messages, model, ct);
+    TraeModelDescriptor descriptor;
+    try { descriptor = await lease.Client.ResolveModelAsync(model, ct); }
+    catch (TraeModelNotFoundException) { return UnsupportedModel(model); }
+    if (ideBridge is null) return IdeBridgeDisabled();
+    var upstream = ideBridge.ChatStreamAsync(messages, descriptor, ct);
     if (stream)
     {
         ctx.Response.ContentType = "text/event-stream";
@@ -359,6 +417,7 @@ Console.WriteLine("  GET  /v1/status");
 Console.WriteLine("  GET  /v1/models");
 Console.WriteLine("  POST /v1/chat/completions   (OpenAI 格式)");
 Console.WriteLine("  POST /v1/messages           (Anthropic 格式)");
+Console.WriteLine($"IDE Bridge: {(ideBridge is null ? "已禁用" : settings.IdeBridge.DebugEndpoint + " (当前 TRAE IDE 账号)")}");
 Console.WriteLine($"网关 Key: {(string.IsNullOrEmpty(gatewayKey) ? "(未设置,仅本机访问)" : "已启用")}");
 Console.WriteLine($"管理端: {(string.IsNullOrEmpty(adminKey) ? "未启用(TRANCN_ADMIN_KEY)" : $"http://{listen}:{port}/admin")}");
 Console.WriteLine();
@@ -445,17 +504,25 @@ string ContentOf(JsonNode? content) => content switch
     _ => ""
 };
 
-bool IsSupportedModel(string model) => true;
-
 IResult UnsupportedModel(string model) => Results.BadRequest(new
 {
     error = new
     {
-        message = $"model '{model}' is not supported by the current Trae chat endpoint; use '{TraeClient.DefaultChatModel}'.",
+        message = $"model '{model}' is not available in the current TRAE account catalog; query /v1/models for exact IDs.",
         type = "invalid_request_error",
         code = "model_not_supported"
     }
 });
+
+IResult IdeBridgeDisabled() => Results.Json(new
+{
+    error = new
+    {
+        message = "TRAE IDE bridge is disabled; enable IdeBridge in appsettings.json to use selectable Agent models.",
+        type = "configuration_error",
+        code = "ide_bridge_disabled"
+    }
+}, statusCode: 503);
 
 async Task<JsonObject> CollectOpenAI(IAsyncEnumerable<TraeSseEvent> upstream, string model, CancellationToken ct)
 {
