@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#0b1324">
+  <title>traecn-proxy · 账号管理台</title>
+  <link rel="stylesheet" href="/admin/admin.css">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">跳到主要内容</a>
+  <main id="app" v-cloak>
+    <header class="hero">
+      <div class="hero-inner">
+        <div class="brand" aria-label="traecn-proxy">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M8 7.5 4.5 12 8 16.5M16 7.5l3.5 4.5-3.5 4.5M14 4l-4 16"/></svg>
+          </span>
+          <div>
+            <p class="eyebrow">TRAE CN PROXY</p>
+            <h1>账号管理台</h1>
+            <p class="hero-copy">集中管理授权账号、调度策略与会话粘滞。</p>
+          </div>
+        </div>
+        <div class="connection" :class="{ ready: connected }" role="status">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span><small>管理端</small>{{ connected ? '安全连接' : '等待认证' }}</span>
+        </div>
+      </div>
+    </header>
+
+    <div id="main-content" class="page-shell" tabindex="-1">
+      <section class="auth-layout" v-if="!connected" aria-labelledby="auth-title">
+        <article class="auth-intro">
+          <span class="section-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 15v2"/></svg>
+          </span>
+          <p class="eyebrow">ADMIN ACCESS</p>
+          <h2 id="auth-title">连接本地管理端</h2>
+          <p>输入 <code>TRANCN_ADMIN_KEY</code> 后读取账号池。Key 仅保存在当前标签页的会话存储中。</p>
+          <ul class="feature-list">
+            <li><svg viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></svg>凭据仅在本机处理</li>
+            <li><svg viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></svg>支持账号级启停与校验</li>
+            <li><svg viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></svg>会话请求自动保持粘滞</li>
+          </ul>
+        </article>
+        <section class="auth-card" aria-label="管理员认证表单">
+          <div class="panel-heading compact">
+            <div><span class="step-label">01 / 连接</span><h2>管理员认证</h2></div>
+          </div>
+          <form class="stack-form" @submit.prevent="connect">
+            <label for="admin-key">管理员 Key</label>
+            <div class="password-field">
+              <input id="admin-key" v-model="adminKey" :type="showKey ? 'text' : 'password'" autocomplete="current-password" required autofocus placeholder="输入管理端密钥">
+              <button class="field-action" type="button" @click="showKey = !showKey" :aria-label="showKey ? '隐藏管理员 Key' : '显示管理员 Key'">
+                <svg v-if="!showKey" viewBox="0 0 24 24"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2.5"/></svg>
+                <svg v-else viewBox="0 0 24 24"><path d="m3 3 18 18M10.6 10.6a2 2 0 0 0 2.8 2.8M9.8 5.2A11 11 0 0 1 12 5c6.5 0 10 7 10 7a16 16 0 0 1-2.1 3M6.6 6.6C3.5 8.3 2 12 2 12s3.5 7 10 7a10 10 0 0 0 3.4-.6"/></svg>
+              </button>
+            </div>
+            <p class="helper">认证失败时，请检查环境变量或 <code>appsettings.json</code>。</p>
+            <button class="button primary full" type="submit" :disabled="isBusy('connect') || !adminKey">
+              <span class="spinner" v-if="isBusy('connect')" aria-hidden="true"></span>
+              <svg v-else viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+              {{ isBusy('connect') ? '正在连接…' : '连接管理端' }}
+            </button>
+          </form>
+        </section>
+      </section>
+
+      <template v-else>
+        <section class="summary-grid" aria-label="账号池概览">
+          <article class="metric primary-metric">
+            <span class="metric-icon"><svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8M22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8"/></svg></span>
+            <span>账号总数</span><strong>{{ accounts.length }}</strong><small>已配置授权账号</small>
+          </article>
+          <article class="metric">
+            <span class="metric-icon success"><svg viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></svg></span>
+            <span>可调度账号</span><strong>{{ enabledCount }}</strong><small>{{ disabledCount ? `${disabledCount} 个已停用` : '全部账号已启用' }}</small>
+          </article>
+          <article class="metric">
+            <span class="metric-icon"><svg viewBox="0 0 24 24"><path d="M4 7h10M4 17h16M14 4v6M10 14v6"/></svg></span>
+            <span>调度策略</span><strong class="metric-word">{{ strategyLabel }}</strong><small>{{ settings.load_balancing === 'priority' ? '按优先级依次选择' : '按并发动态均衡' }}</small>
+          </article>
+          <article class="metric">
+            <span class="metric-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span>
+            <span>会话粘滞</span><strong>{{ settings.session_ttl_minutes }}<em>分钟</em></strong><small>相同会话复用账号</small>
+          </article>
+        </section>
+
+        <section class="panel account-panel" aria-labelledby="accounts-title">
+          <div class="panel-heading">
+            <div>
+              <span class="step-label">ACCOUNT POOL</span>
+              <h2 id="accounts-title">账号池</h2>
+              <p>每个请求在完整响应周期内锁定一个账号，避免流式响应串号。</p>
+            </div>
+            <button class="button secondary" @click="loadAccounts('refresh')" :disabled="isBusy('refresh')">
+              <span class="spinner dark" v-if="isBusy('refresh')"></span>
+              <svg v-else viewBox="0 0 24 24"><path d="M20 6v5h-5M4 18v-5h5M6.1 9A7 7 0 0 1 18.5 6M5.5 18A7 7 0 0 0 18 15"/></svg>
+              刷新数据
+            </button>
+          </div>
+
+          <div class="account-list" role="region" aria-live="polite" aria-label="账号列表">
+            <div class="account-row account-header" aria-hidden="true">
+              <span>账号</span><span>状态</span><span>优先级</span><span>Token 到期</span><span>最近错误</span><span>操作</span>
+            </div>
+            <article class="account-row" v-for="account in accounts" :key="account.alias" :class="{ disabled: !account.enabled }">
+              <div class="account-identity" data-label="账号">
+                <span class="avatar">{{ initials(account.alias) }}</span>
+                <span><strong>{{ account.alias }}</strong><small>{{ account.user || '未识别用户' }}</small></span>
+              </div>
+              <div data-label="状态">
+                <span class="badge" :class="account.enabled ? tokenState(account).className : 'muted'">
+                  <span class="badge-dot"></span>{{ account.enabled ? tokenState(account).label : '已停用' }}
+                </span>
+              </div>
+              <label class="priority-field" data-label="优先级" :for="`priority-${account.alias}`">
+                <span class="sr-only">{{ account.alias }} 优先级</span>
+                <input :id="`priority-${account.alias}`" type="number" v-model.number="account.priority" @change="setPriority(account)" :disabled="isBusy(`priority:${account.alias}`)">
+              </label>
+              <div class="date-cell" data-label="Token 到期"><strong>{{ formatDate(account.token_expires) }}</strong><small>{{ relativeExpiry(account.token_expires) }}</small></div>
+              <div class="error-cell" data-label="最近错误" :title="account.last_error || ''">
+                <svg v-if="account.last_error" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 17h.01"/></svg>
+                <span>{{ account.last_error || '无错误记录' }}</span>
+              </div>
+              <div class="actions" data-label="操作">
+                <button class="icon-button" @click="testAccount(account)" :disabled="isBusy(`test:${account.alias}`)" title="测试 Token" :aria-label="`测试 ${account.alias} Token`">
+                  <span class="spinner dark" v-if="isBusy(`test:${account.alias}`)"></span><svg v-else viewBox="0 0 24 24"><path d="M9 3h6M10 9l-4.5 8a2 2 0 0 0 1.7 3h9.6a2 2 0 0 0 1.7-3L14 9V3h-4v6Z"/><path d="M8 15h8"/></svg>
+                </button>
+                <button class="icon-button" @click="refreshAccount(account)" :disabled="isBusy(`refresh:${account.alias}`)" title="刷新 Token" :aria-label="`刷新 ${account.alias} Token`">
+                  <span class="spinner dark" v-if="isBusy(`refresh:${account.alias}`)"></span><svg v-else viewBox="0 0 24 24"><path d="M20 6v5h-5M4 18v-5h5M6.1 9A7 7 0 0 1 18.5 6M5.5 18A7 7 0 0 0 18 15"/></svg>
+                </button>
+                <button class="icon-button" @click="toggleAccount(account)" :disabled="isBusy(`toggle:${account.alias}`)" :title="account.enabled ? '停用账号' : '启用账号'" :aria-label="`${account.enabled ? '停用' : '启用'} ${account.alias}`">
+                  <span class="spinner dark" v-if="isBusy(`toggle:${account.alias}`)"></span><svg v-else viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5M8.5 9.5a5 5 0 1 0 7 0"/></svg>
+                </button>
+                <button class="icon-button danger" @click="removeAccount(account)" :disabled="isBusy(`remove:${account.alias}`)" title="删除账号" :aria-label="`删除 ${account.alias}`">
+                  <span class="spinner danger-spinner" v-if="isBusy(`remove:${account.alias}`)"></span><svg v-else viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5"/></svg>
+                </button>
+              </div>
+            </article>
+            <div class="empty-state" v-if="accounts.length === 0">
+              <span class="empty-icon"><svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8M19 8v6M16 11h6"/></svg></span>
+              <h3>还没有账号</h3><p>通过下方网页登录或 JSON 导入添加第一个授权账号。</p>
+            </div>
+          </div>
+        </section>
+
+        <div class="split-grid">
+          <section class="panel" aria-labelledby="login-title">
+            <div class="panel-heading compact">
+              <div><span class="section-icon"><svg viewBox="0 0 24 24"><path d="M15 7h4a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2v-4M13 3H5a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2Z"/><path d="m10 8 2 2 5-5"/></svg></span><h2 id="login-title">添加网页登录账号</h2><p>通过 Trae CN OAuth2 授权，成功后自动加入账号池。</p></div>
+            </div>
+            <form class="stack-form" @submit.prevent="startLogin">
+              <label for="login-alias">账号别名</label>
+              <input id="login-alias" v-model.trim="loginAlias" placeholder="例如 team-a" required pattern="[A-Za-z0-9_-]+" autocomplete="off">
+              <p class="helper">仅支持字母、数字、短横线和下划线。</p>
+              <button class="button primary" type="submit" :disabled="isBusy('login') || !loginAlias">
+                <span class="spinner" v-if="isBusy('login')"></span><svg v-else viewBox="0 0 24 24"><path d="M14 5h5v5M10 14 19 5M19 14v5H5V5h5"/></svg>
+                {{ isBusy('login') ? '正在创建授权…' : '打开 Trae 授权' }}
+              </button>
+            </form>
+          </section>
+
+          <section class="panel" aria-labelledby="settings-title">
+            <div class="panel-heading compact">
+              <div><span class="section-icon"><svg viewBox="0 0 24 24"><path d="M4 7h10M4 17h16M14 4v6M10 14v6"/></svg></span><h2 id="settings-title">调度设置</h2><p>设置会立即写入账号库，并应用到后续请求。</p></div>
+            </div>
+            <form class="settings-form" @submit.prevent="saveSettings">
+              <label for="load-balancing">调度策略<select id="load-balancing" v-model="settings.load_balancing"><option value="priority">优先级调度</option><option value="balanced">并发均衡</option></select></label>
+              <label for="session-ttl">粘滞时间（分钟）<input id="session-ttl" v-model.number="settings.session_ttl_minutes" type="number" min="1" max="1440" required></label>
+              <button class="button primary" type="submit" :disabled="isBusy('settings')">
+                <span class="spinner" v-if="isBusy('settings')"></span><svg v-else viewBox="0 0 24 24"><path d="M5 12 9 16 19 6"/></svg>
+                {{ isBusy('settings') ? '正在保存…' : '保存设置' }}
+              </button>
+            </form>
+          </section>
+        </div>
+
+        <section class="panel import-panel" aria-labelledby="import-title">
+          <div class="panel-heading">
+            <div><span class="step-label danger-label">ADVANCED</span><h2 id="import-title">JSON 批量导入</h2><p>接受 <code>accounts.json</code> 对象或账号数组。导入会完整替换当前账号集合。</p></div>
+            <span class="risk-badge"><svg viewBox="0 0 24 24"><path d="M12 3 2.5 20h19L12 3Z"/><path d="M12 9v5M12 17h.01"/></svg>覆盖操作</span>
+          </div>
+          <label class="sr-only" for="import-json">账号 JSON</label>
+          <textarea id="import-json" v-model="importJson" spellcheck="false" placeholder="在此粘贴账号 JSON…"></textarea>
+          <div class="form-footer">
+            <span><svg viewBox="0 0 24 24"><path d="M12 21s8-4 8-10V5l-8-3-8 3v6c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></svg>凭据仅写入本机账号数据目录</span>
+            <button class="button danger-button" @click="importAccounts" :disabled="isBusy('import') || !importJson.trim()">
+              <span class="spinner" v-if="isBusy('import')"></span><svg v-else viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>
+              {{ isBusy('import') ? '正在导入…' : '导入并替换' }}
+            </button>
+          </div>
+        </section>
+      </template>
+    </div>
+
+    <div class="toast" v-if="notice" :class="notice.type" role="status" aria-live="polite">
+      <svg v-if="notice.type === 'success'" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></svg>
+      <svg v-else viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 17h.01"/></svg>
+      <span>{{ notice.text }}</span><button @click="notice = null" aria-label="关闭提示">×</button>
+    </div>
+  </main>
+  <script src="https://unpkg.com/vue@3.5.13/dist/vue.global.prod.js"></script>
+  <script src="/admin/admin.js"></script>
+</body>
+</html>

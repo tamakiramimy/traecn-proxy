@@ -106,9 +106,18 @@ console.enterprise.trae.cn(上游,经企业代理)
 独立会话标记 `Standalone=true`:刷新只更新缓存,**不写 IDE 的 storage.json**,与 IDE 会话互不干扰。
 `--weblogin` 强制走此流程;`--login` 仍从 IDE storage.json 读取。
 
-### 3.7 安全设计(针对多人共享)
+### 3.7 多账号运行时(已实现基础版)
+- 对外仍是单个 `/v1` API；内部 `MultiAccountManager` 管理多个 Trae 账号，按 `priority` 或 `balanced` 策略选择账号。
+- 请求开始时获得固定 `AccountLease`，流式输出开始后不切换账号；每账号有独立 `TraeClient`、刷新锁和并发上限。
+- 会话粘滞键来自 `X-Trancn-Session-Id`、OpenAI/Responses `user` 或 Anthropic `metadata.user_id`，默认有效期一小时。
+- 凭据保存于 `~/.config/trancn-proxy/accounts.json`，首启自动迁移旧 `auth.json`。独立网页登录账号不会回写 IDE `storage.json`。
+- 管理端为 `/admin`，账号 JSON 导入与网页登录使用独立 `TRANCN_ADMIN_KEY`；网页登录回调有 PKCE、随机 state 和五分钟有效期保护。
+- 详细设计与实施计划见 [multi-account-design.md](multi-account-design.md) 和 [multi-account-implementation-plan.md](multi-account-implementation-plan.md)。
+
+### 3.8 安全设计(针对多人共享)
 | 项 | 设计 |
 |----|------|
+| 服务配置 | `appsettings.json` 保存监听地址、端口、业务 Key、管理 Key、账号目录和 OAuth 回调地址；命令行与环境变量可覆盖对应项 |
 | 令牌落盘 | 缓存文件 0600;正式版可选 DPAPI/Keychain 加密 |
 | 监听 | 默认 `127.0.0.1`;`--listen 0.0.0.0` 需显式开启并提示 |
 | 网关 Key | 必填才对外;`Authorization: Bearer` 或 `x-api-key` 校验;正式版支持多 key + 每 key 限速/限额 |
@@ -139,11 +148,11 @@ console.enterprise.trae.cn(上游,经企业代理)
 
 ---
 
-## 6. 后续开发计划(确认后执行)
+## 6. 后续开发计划
 
-- **阶段 1(核心可用)**:模型选择问题(#1)→ ExchangeToken 实测(#2)→ reasoning 分离(#3)→ 多 key 网关 + 用量统计。
-- **阶段 2(增强)**:Anthropic tool_use 完整支持 → count_tokens → 模型映射表(外部名 → 内部 config_name)→ 登录方案 B(无 IDE 环境)。
-- **阶段 3(运维)**:systemd/launchd 常驻、日志轮转、优雅停机、Docker 部署说明。
+- **阶段 1(多账号基础)**:账号存储、统一 API 选择、会话粘滞、JSON 导入、管理端 OAuth 和账号级刷新已完成；后续补充失败冷却、流式输出前 failover 和更多测试。
+- **阶段 2(协议增强)**:模型选择问题(#1)→ reasoning 分离(#3)→ Anthropic tool_use/count_tokens → 模型映射表。
+- **阶段 3(运维)**:账号用量统计、日志轮转、优雅停机、Docker 部署说明；如需多实例再引入数据库和分布式锁。
 
 ---
 

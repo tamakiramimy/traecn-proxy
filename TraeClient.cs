@@ -20,6 +20,8 @@ public class TraeClient
     public const string DefaultAppId = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
     public const string DefaultClientId = "ono9krqynydwx5";
     public const int AppVersionCode = 20260806;
+    // The current enterprise chat endpoint always selects this tenant default model.
+    public const string DefaultChatModel = "Doubao-Seed-Evolving";
 
     private readonly HttpClient _http;
     private readonly string _apiHost;
@@ -149,7 +151,7 @@ public class TraeClient
         {
             ["messages"] = msgList,
             ["model"] = model,
-            ["function"] = "chat_v3",
+            ["function"] = "inline_chat",
             ["stream"] = true,
             ["request_id"] = Guid.NewGuid().ToString(),
             ["session_id"] = sessionId,

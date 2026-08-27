@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Security.Cryptography;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
@@ -11,16 +12,27 @@ var argsList = args.ToList();
 bool forceLogin = argsList.Remove("--login");
 bool webLogin = argsList.Remove("--weblogin");
 bool testMode = argsList.Remove("--test");
-int port = 9220;
-string listen = "127.0.0.1";
-string? gatewayKey = Environment.GetEnvironmentVariable("TRANCN_API_KEY");
-string testModel = "glm-5.2__max";
+bool listAccounts = argsList.Remove("--account-list");
+var settings = ProxySettings.Load();
+int port = settings.Server.Port;
+string listen = settings.Server.Listen;
+string? gatewayKey = Environment.GetEnvironmentVariable("TRANCN_API_KEY") ?? EmptyToNull(settings.Security.ApiKey);
+string? adminKey = Environment.GetEnvironmentVariable("TRANCN_ADMIN_KEY") ?? EmptyToNull(settings.Security.AdminKey);
+string testModel = TraeClient.DefaultChatModel;
+string accountAlias = "default";
+string? dataDirectory = EmptyToNull(settings.Accounts.DataDirectory);
+string? importPath = null;
+string? publicBaseUrl = Environment.GetEnvironmentVariable("TRANCN_PUBLIC_BASE_URL") ?? EmptyToNull(settings.Server.PublicBaseUrl);
 for (int i = 0; i < argsList.Count; i++)
 {
     if (argsList[i] == "--port" && i + 1 < argsList.Count) port = int.Parse(argsList[++i]);
     else if (argsList[i] == "--listen" && i + 1 < argsList.Count) listen = argsList[++i];
     else if (argsList[i] == "--api-key" && i + 1 < argsList.Count) gatewayKey = argsList[++i];
     else if (argsList[i] == "--model" && i + 1 < argsList.Count) testModel = argsList[++i];
+    else if (argsList[i] == "--account" && i + 1 < argsList.Count) accountAlias = argsList[++i];
+    else if (argsList[i] == "--data-dir" && i + 1 < argsList.Count) dataDirectory = argsList[++i];
+    else if (argsList[i] == "--account-import" && i + 1 < argsList.Count) importPath = argsList[++i];
+    else if (argsList[i] == "--public-base-url" && i + 1 < argsList.Count) publicBaseUrl = argsList[++i];
 }
 
 if (argsList.Remove("--tc-test"))
@@ -34,95 +46,72 @@ if (argsList.Remove("--tc-test"))
 Console.WriteLine("=== trancn-proxy : Trae CN 企业版 -> OpenAI/Anthropic 兼容代理 ===");
 Console.WriteLine($"数据目录: {TraeAuthStore.DataDir}");
 
-// ---------- 1. 引导授权 ----------
-TraeAuthData auth = new();
-if (!forceLogin && !webLogin)
+// ---------- 1. 多账号加载与授权 ----------
+dataDirectory ??= TraeAuthStore.CacheDir;
+ProxyInstanceLock instanceLock;
+try { instanceLock = ProxyInstanceLock.Acquire(dataDirectory); }
+catch (InvalidOperationException ex)
 {
-    auth = TraeAuthStore.ReadCache() ?? new TraeAuthData();
-    if (string.IsNullOrEmpty(auth.Token))
-    {
-        try
-        {
-            Console.WriteLine("缓存无授权,从 Trae CN 本地数据解密 ...");
-            auth = TraeAuthStore.ReadFromStorage();
-            TraeAuthStore.SaveCache(auth);
-            Console.WriteLine($"已解密并缓存(用户: {auth.Username}/{auth.Email ?? auth.UserId})");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"本地解密失败: {ex.Message}");
-            auth = new TraeAuthData();
-        }
-    }
-    else
-    {
-        Console.WriteLine($"使用缓存授权(用户: {auth.Username}/{auth.Email ?? auth.UserId})");
-    }
+    Console.Error.WriteLine(ex.Message);
+    return 1;
 }
-else
+using (instanceLock)
 {
-    Console.WriteLine(webLogin ? "--weblogin: 强制网页授权(不依赖 Trae CN IDE)" : "--login: 强制重新读取 IDE 本地授权");
+var accountStore = new TraeAccountStore(dataDirectory);
+var accountManager = new MultiAccountManager(accountStore);
+var oauthLogins = new TraeOAuthLoginManager();
+if (!string.IsNullOrWhiteSpace(importPath))
+{
+    accountManager.ImportJson(await File.ReadAllTextAsync(importPath));
+    Console.WriteLine($"已导入 {accountManager.Accounts.Count} 个账号。");
+    return 0;
 }
 
-var (deviceId, machineId) = TraeAuthStore.ReadDeviceIds();
-var client = new TraeClient(auth, deviceId, machineId);
-Console.WriteLine($"上游: {client.ApiHost}  设备ID: {deviceId[..Math.Min(4, deviceId.Length)]}***");
-
-if (!webLogin && (string.IsNullOrEmpty(auth.Token) || forceLogin))
+if (forceLogin)
 {
-    try { auth = TraeAuthStore.ReadFromStorage(); client = new TraeClient(auth, deviceId, machineId); }
-    catch { auth = new TraeAuthData(); }
+    var auth = TraeAuthStore.ReadFromStorage();
+    var (deviceId, machineId) = TraeAuthStore.ReadDeviceIds();
+    accountManager.AddOrReplace(new TraeAccount
+    {
+        Alias = accountAlias,
+        Auth = auth,
+        DeviceId = deviceId,
+        MachineId = machineId
+    });
+    Console.WriteLine($"已从 IDE 导入账号: {accountAlias}");
 }
 
-if (string.IsNullOrEmpty(auth.Token) || !await client.ValidateTokenAsync())
+if (webLogin || accountManager.Accounts.Count == 0)
 {
-    if (!string.IsNullOrEmpty(auth.RefreshToken) &&
-        (auth.RefreshExpiredAt is null || DateTimeOffset.UtcNow < auth.RefreshExpiredAt))
+    var (deviceId, machineId) = TraeAuthStore.ReadDeviceIds();
+    var bootstrapClient = new TraeClient(new TraeAuthData(), deviceId, machineId);
+    var auth = await StandaloneLogin.LoginAsync(bootstrapClient, machineId, deviceId);
+    accountManager.AddOrReplace(new TraeAccount
     {
-        try
-        {
-            Console.WriteLine("token 无效,尝试 refreshToken 续期 ...");
-            await client.ExchangeTokenAsync();
-            auth.TokenReleaseAt = DateTimeOffset.UtcNow;
-            TraeAuthStore.SaveCache(auth);
-            if (!auth.Standalone)
-            {
-                try { TraeAuthStore.WriteBackToStorage(auth); Console.WriteLine("已回写 storage.json"); }
-                catch (Exception ex) { Console.WriteLine($"回写失败: {ex.Message}"); }
-            }
-            Console.WriteLine($"续期成功,新过期时间: {auth.ExpiredAt}");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"续期失败: {ex.Message}");
-            auth = new TraeAuthData();
-        }
-    }
-
-    if (string.IsNullOrEmpty(auth.Token) || !await client.ValidateTokenAsync())
-    {
-        try
-        {
-            auth = await StandaloneLogin.LoginAsync(client, machineId, deviceId);
-            client = new TraeClient(auth, deviceId, machineId);
-            TraeAuthStore.SaveCache(auth);
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"授权失败: {ex.Message}");
-            return 1;
-        }
-    }
+        Alias = accountAlias,
+        Auth = auth,
+        DeviceId = deviceId,
+        MachineId = machineId
+    });
+    Console.WriteLine($"已添加网页授权账号: {accountAlias}");
 }
 
-Console.WriteLine($"授权就绪: {auth.Username ?? auth.UserId}  token过期: {auth.ExpiredAt:yyyy-MM-dd HH:mm}Z  refresh过期: {auth.RefreshExpiredAt:yyyy-MM-dd}");
+if (listAccounts)
+{
+    foreach (var account in accountManager.Accounts.OrderBy(x => x.Alias))
+        Console.WriteLine($"{account.Alias,-16} {(account.Enabled ? "enabled" : "disabled"),-8} {account.Auth.Username ?? account.Auth.UserId}  expires={account.Auth.ExpiredAt:yyyy-MM-dd HH:mm}Z");
+    return 0;
+}
+
+Console.WriteLine($"账号池就绪: {accountManager.Accounts.Count} 个账号");
 
 // ---------- 2. 自测模式 ----------
 if (testMode)
 {
     Console.WriteLine($"--- 自测:向 {testModel} 发送消息 ---");
     var sb = new StringBuilder();
-    await foreach (var ev in client.ChatStreamAsync(new[] { ("user", "请只回复四个字:验证成功") }, testModel))
+    using var lease = accountManager.AcquireByAlias(accountAlias);
+    await foreach (var ev in lease.Client.ChatStreamAsync(new[] { ("user", "请只回复四个字:验证成功") }, testModel))
     {
         if (ev.Event == "metadata")
         {
@@ -149,24 +138,32 @@ if (testMode)
 var builder = WebApplication.CreateSlimBuilder(argsList.ToArray());
 builder.Logging.ClearProviders();
 builder.Logging.AddSimpleConsole(o => { o.TimestampFormat = "HH:mm:ss "; o.SingleLine = true; });
-builder.Services.AddSingleton(auth);
-builder.Services.AddSingleton(client);
 
 var app = builder.Build();
 app.Urls.Add($"http://{listen}:{port}");
+app.UseDefaultFiles();
+app.UseStaticFiles();
 
 app.Use(async (ctx, next) =>
 {
-    if (!string.IsNullOrEmpty(gatewayKey) && ctx.Request.Path.StartsWithSegments("/v1"))
+    bool isBusinessApi = ctx.Request.Path.StartsWithSegments("/v1");
+    bool isAdminApi = ctx.Request.Path.StartsWithSegments("/admin/api");
+    if ((isBusinessApi && !string.IsNullOrEmpty(gatewayKey)) || (isAdminApi && !string.IsNullOrEmpty(adminKey)))
     {
         string? given = ctx.Request.Headers.Authorization.ToString().Replace("Bearer ", "").Trim();
         given = string.IsNullOrEmpty(given) ? ctx.Request.Headers["x-api-key"].ToString().Trim() : given;
-        if (given != gatewayKey)
+        string expected = isAdminApi ? adminKey! : gatewayKey!;
+        if (!CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(given), Encoding.UTF8.GetBytes(expected)))
         {
             ctx.Response.StatusCode = 401;
-            await ctx.Response.WriteAsJsonAsync(new { error = new { message = "invalid gateway api key", type = "authentication_error" } });
+            await ctx.Response.WriteAsJsonAsync(new { error = new { message = "invalid api key", type = "authentication_error" } });
             return;
         }
+    }
+    else if (isAdminApi && string.IsNullOrEmpty(adminKey))
+    {
+        ctx.Response.StatusCode = 404;
+        return;
     }
     await next();
 });
@@ -174,47 +171,45 @@ app.Use(async (ctx, next) =>
 app.MapGet("/v1/status", () => new
 {
     ok = true,
-    user = auth.Username ?? auth.UserId,
-    api_host = client.ApiHost,
-    token_expires = auth.ExpiredAt,
-    refresh_expires = auth.RefreshExpiredAt
+    accounts = accountManager.Accounts.Select(x => new
+    {
+        alias = x.Alias,
+        enabled = x.Enabled,
+        user = x.Auth.Username ?? x.Auth.UserId,
+        token_expires = x.Auth.ExpiredAt,
+        refresh_expires = x.Auth.RefreshExpiredAt,
+        last_error = x.LastError
+    })
 });
 
-app.MapGet("/v1/models", async (CancellationToken ct) =>
+app.MapGet("/v1/models", () =>
 {
-    var catalog = await client.GetModelCatalogAsync(ct: ct);
-    var models = new JsonArray();
-    foreach (var fc in catalog["function_configs"]?.AsArray() ?? new JsonArray())
+    var model = TraeClient.DefaultChatModel;
+    return Results.Json(new JsonObject
     {
-        foreach (var cfg in fc?["config_info_list"]?.AsArray() ?? new JsonArray())
+        ["object"] = "list",
+        ["data"] = new JsonArray(new JsonObject
         {
-            string name = (string?)cfg?["config_name"] ?? "";
-            string display = (string?)cfg?["display_config"]?["display_name"] ?? name;
-            if (string.IsNullOrEmpty(name) || name.StartsWith("custom_model_") ||
-                name is "summary" or "fast_apply" or "fast_apply_new" or "title_generation" or "input_optimization")
-                continue;
-            models.Add(new JsonObject
-            {
-                ["id"] = name,
-                ["display_name"] = display,
-                ["owned_by"] = "trae"
-            });
-        }
-    }
-    return Results.Json(new JsonObject { ["object"] = "list", ["data"] = models });
+            ["id"] = model,
+            ["display_name"] = model,
+            ["owned_by"] = "trae"
+        })
+    });
 });
 
 app.MapPost("/v1/chat/completions", async (HttpContext ctx) =>
 {
     var ct = ctx.RequestAborted;
     var body = JsonNode.Parse(await new StreamReader(ctx.Request.Body).ReadToEndAsync(ct))!.AsObject();
-    string model = (string?)body["model"] ?? "glm-5.2__max";
+    string model = (string?)body["model"] ?? TraeClient.DefaultChatModel;
+    if (!IsSupportedModel(model)) return UnsupportedModel(model);
     bool stream = body["stream"] is JsonValue sv && sv.TryGetValue<bool>(out var sb) && sb;
     var messages = ConvertOpenAIMessages(body["messages"]?.AsArray());
     if (messages.Count == 0)
         return Results.BadRequest(new { error = new { message = "messages is required", type = "invalid_request_error" } });
 
-    var upstream = client.ChatStreamAsync(messages, model, ct);
+    using var lease = accountManager.Acquire(SessionKey(ctx, body));
+    var upstream = lease.Client.ChatStreamAsync(messages, model, ct);
     if (stream)
     {
         ctx.Response.ContentType = "text/event-stream";
@@ -229,13 +224,15 @@ app.MapPost("/v1/responses", async (HttpContext ctx) =>
 {
     var ct = ctx.RequestAborted;
     var body = JsonNode.Parse(await new StreamReader(ctx.Request.Body).ReadToEndAsync(ct))!.AsObject();
-    string model = (string?)body["model"] ?? "glm-5.2__max";
+    string model = (string?)body["model"] ?? TraeClient.DefaultChatModel;
+    if (!IsSupportedModel(model)) return UnsupportedModel(model);
     bool stream = body["stream"] is JsonValue sv && sv.TryGetValue<bool>(out var sb) && sb;
     var messages = ConvertResponsesInput(body["input"]);
     if (messages.Count == 0)
         return Results.BadRequest(new { error = new { message = "input is required", type = "invalid_request_error" } });
 
-    var upstream = client.ChatStreamAsync(messages, model, ct);
+    using var lease = accountManager.Acquire(SessionKey(ctx, body));
+    var upstream = lease.Client.ChatStreamAsync(messages, model, ct);
     string respId = $"resp_{Guid.NewGuid():N}";
     if (stream)
     {
@@ -250,13 +247,15 @@ app.MapPost("/v1/messages", async (HttpContext ctx) =>
 {
     var ct = ctx.RequestAborted;
     var body = JsonNode.Parse(await new StreamReader(ctx.Request.Body).ReadToEndAsync(ct))!.AsObject();
-    string model = (string?)body["model"] ?? "glm-5.2__max";
+    string model = (string?)body["model"] ?? TraeClient.DefaultChatModel;
+    if (!IsSupportedModel(model)) return UnsupportedModel(model);
     bool stream = body["stream"] is JsonValue sv && sv.TryGetValue<bool>(out var sb) && sb;
     var messages = ConvertAnthropicMessages(body);
     if (messages.Count == 0)
         return Results.BadRequest(new { type = "error", error = new { message = "messages is required", type = "invalid_request_error" } });
 
-    var upstream = client.ChatStreamAsync(messages, model, ct);
+    using var lease = accountManager.Acquire(SessionKey(ctx, body));
+    var upstream = lease.Client.ChatStreamAsync(messages, model, ct);
     if (stream)
     {
         ctx.Response.ContentType = "text/event-stream";
@@ -266,6 +265,94 @@ app.MapPost("/v1/messages", async (HttpContext ctx) =>
     return Results.Json(await CollectAnthropic(upstream, model, ct));
 });
 
+app.MapGet("/admin/api/accounts", () => Results.Json(new
+{
+    accounts = accountManager.Accounts.OrderBy(x => x.Alias).Select(x => new
+    {
+        alias = x.Alias,
+        enabled = x.Enabled,
+        priority = x.Priority,
+        max_concurrency = x.MaxConcurrency,
+        user = x.Auth.Username ?? x.Auth.UserId,
+        token_expires = x.Auth.ExpiredAt,
+        refresh_expires = x.Auth.RefreshExpiredAt,
+        last_used_at = x.LastUsedAt,
+        last_success_at = x.LastSuccessAt,
+        last_error = x.LastError
+    }),
+    settings = new { load_balancing = accountManager.Settings.LoadBalancing, session_ttl_minutes = accountManager.Settings.SessionTtlMinutes }
+}));
+
+app.MapPost("/admin/api/accounts/import", async (HttpContext ctx) =>
+{
+    try
+    {
+        accountManager.ImportJson(await new StreamReader(ctx.Request.Body).ReadToEndAsync(ctx.RequestAborted));
+        return Results.Ok(new { ok = true, accounts = accountManager.Accounts.Count });
+    }
+    catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+});
+
+app.MapPost("/admin/api/accounts/{alias}/enable", (string alias) =>
+    accountManager.SetEnabled(alias, true) ? Results.Ok(new { ok = true }) : Results.NotFound());
+app.MapPost("/admin/api/accounts/{alias}/disable", (string alias) =>
+    accountManager.SetEnabled(alias, false) ? Results.Ok(new { ok = true }) : Results.NotFound());
+app.MapDelete("/admin/api/accounts/{alias}", (string alias) =>
+    accountManager.Remove(alias) ? Results.NoContent() : Results.NotFound());
+app.MapPost("/admin/api/accounts/{alias}/priority/{priority:int}", (string alias, int priority) =>
+    accountManager.SetPriority(alias, priority) ? Results.Ok(new { ok = true }) : Results.NotFound());
+app.MapPost("/admin/api/accounts/{alias}/refresh", async (string alias, CancellationToken ct) =>
+{
+    try { return await accountManager.RefreshAsync(alias, ct) ? Results.Ok(new { ok = true }) : Results.BadRequest(new { error = "refresh failed" }); }
+    catch (Exception ex) { return Results.NotFound(new { error = ex.Message }); }
+});
+app.MapPost("/admin/api/accounts/{alias}/test", async (string alias, CancellationToken ct) =>
+{
+    try
+    {
+        using var lease = accountManager.AcquireByAlias(alias);
+        return await lease.Client.ValidateTokenAsync(ct) ? Results.Ok(new { ok = true }) : Results.BadRequest(new { error = "token validation failed" });
+    }
+    catch (Exception ex) { return Results.NotFound(new { error = ex.Message }); }
+});
+app.MapPut("/admin/api/settings", async (HttpContext ctx) =>
+{
+    try
+    {
+        var body = JsonNode.Parse(await new StreamReader(ctx.Request.Body).ReadToEndAsync(ctx.RequestAborted))?.AsObject();
+        accountManager.UpdateSettings((string?)body?["load_balancing"] ?? accountManager.Settings.LoadBalancing,
+            (int?)body?["session_ttl_minutes"] ?? accountManager.Settings.SessionTtlMinutes);
+        return Results.Ok(new { ok = true });
+    }
+    catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+});
+app.MapPost("/admin/api/accounts/login/start", async (HttpContext ctx) =>
+{
+    try
+    {
+        var body = JsonNode.Parse(await new StreamReader(ctx.Request.Body).ReadToEndAsync(ctx.RequestAborted))?.AsObject();
+        string alias = (string?)body?["alias"] ?? "";
+        var (deviceId, machineId) = TraeAuthStore.ReadDeviceIds();
+        string baseUrl = publicBaseUrl ?? $"http://{(listen is "0.0.0.0" or "::" ? "127.0.0.1" : listen)}:{port}";
+        string callbackUrl = baseUrl.TrimEnd('/') + "/admin/oauth/callback";
+        return Results.Ok(new { authorization_url = oauthLogins.Begin(alias, callbackUrl, deviceId, machineId) });
+    }
+    catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+});
+app.MapGet("/admin/oauth/callback", async (HttpContext ctx) =>
+{
+    try
+    {
+        var account = await oauthLogins.CompleteAsync(ctx.Request.Query, ctx.RequestAborted);
+        accountManager.AddOrReplace(account);
+        return Results.Content("<html><body><h2>授权成功</h2><p>账号已保存，可以关闭此页面返回管理界面。</p></body></html>", "text/html; charset=utf-8");
+    }
+    catch (Exception ex)
+    {
+        return Results.Content($"<html><body><h2>授权失败</h2><p>{System.Net.WebUtility.HtmlEncode(ex.Message)}</p></body></html>", "text/html; charset=utf-8", statusCode: 400);
+    }
+});
+
 Console.WriteLine();
 Console.WriteLine($"API 服务: http://{listen}:{port}");
 Console.WriteLine("  GET  /v1/status");
@@ -273,17 +360,38 @@ Console.WriteLine("  GET  /v1/models");
 Console.WriteLine("  POST /v1/chat/completions   (OpenAI 格式)");
 Console.WriteLine("  POST /v1/messages           (Anthropic 格式)");
 Console.WriteLine($"网关 Key: {(string.IsNullOrEmpty(gatewayKey) ? "(未设置,仅本机访问)" : "已启用")}");
+Console.WriteLine($"管理端: {(string.IsNullOrEmpty(adminKey) ? "未启用(TRANCN_ADMIN_KEY)" : $"http://{listen}:{port}/admin")}");
 Console.WriteLine();
 
-var refresh = new TokenRefreshService(auth, client);
 using var cts = new CancellationTokenSource();
-_ = refresh.StartAsync(cts.Token);
+_ = Task.Run(async () =>
+{
+    while (!cts.Token.IsCancellationRequested)
+    {
+        try { await accountManager.RefreshExpiringAccountsAsync(cts.Token); }
+        catch (Exception ex) { Console.WriteLine($"[refresh] 账号池刷新失败: {ex.Message}"); }
+        try { await Task.Delay(TimeSpan.FromMinutes(30), cts.Token); }
+        catch (OperationCanceledException) { break; }
+    }
+}, cts.Token);
 
 await app.RunAsync();
 cts.Cancel();
 return 0;
+}
 
 // ==================== helpers ====================
+
+string? EmptyToNull(string? value) => string.IsNullOrWhiteSpace(value) ? null : value;
+
+string? SessionKey(HttpContext ctx, JsonObject body)
+{
+    string value = ctx.Request.Headers["X-Trancn-Session-Id"].ToString();
+    if (string.IsNullOrWhiteSpace(value)) value = (string?)body["user"] ?? "";
+    if (string.IsNullOrWhiteSpace(value)) value = (string?)body["metadata"]?["user_id"] ?? "";
+    if (string.IsNullOrWhiteSpace(value)) return null;
+    return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)));
+}
 
 List<(string role, string text)> ConvertOpenAIMessages(JsonArray? arr)
 {
@@ -336,6 +444,18 @@ string ContentOf(JsonNode? content) => content switch
     })),
     _ => ""
 };
+
+bool IsSupportedModel(string model) => true;
+
+IResult UnsupportedModel(string model) => Results.BadRequest(new
+{
+    error = new
+    {
+        message = $"model '{model}' is not supported by the current Trae chat endpoint; use '{TraeClient.DefaultChatModel}'.",
+        type = "invalid_request_error",
+        code = "model_not_supported"
+    }
+});
 
 async Task<JsonObject> CollectOpenAI(IAsyncEnumerable<TraeSseEvent> upstream, string model, CancellationToken ct)
 {
