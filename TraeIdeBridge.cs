@@ -13,17 +13,23 @@ public sealed class TraeIdeBridge
     private readonly Uri _debugEndpoint;
     private readonly TimeSpan _requestTimeout;
     private readonly TimeSpan _pollInterval;
+    private readonly TraeProtocolEvidenceWriter? _protocolEvidenceWriter;
     private readonly SemaphoreSlim _initializationGate = new(1, 1);
     private readonly SemaphoreSlim _requestGate = new(1, 1);
     private bool _hookInitialized;
 
     /// <summary>Initializes the IDE bridge.</summary>
-    public TraeIdeBridge(string debugEndpoint, TimeSpan? requestTimeout = null, TimeSpan? pollInterval = null)
+    public TraeIdeBridge(
+        string debugEndpoint,
+        TimeSpan? requestTimeout = null,
+        TimeSpan? pollInterval = null,
+        TraeProtocolEvidenceWriter? protocolEvidenceWriter = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(debugEndpoint);
         _debugEndpoint = new Uri(debugEndpoint.TrimEnd('/') + "/", UriKind.Absolute);
         _requestTimeout = requestTimeout ?? TimeSpan.FromMinutes(5);
         _pollInterval = pollInterval ?? TimeSpan.FromMilliseconds(35);
+        _protocolEvidenceWriter = protocolEvidenceWriter;
         _httpClient = new HttpClient(new HttpClientHandler { UseProxy = false })
         {
             Timeout = TimeSpan.FromSeconds(5)
@@ -99,6 +105,9 @@ public sealed class TraeIdeBridge
 
                     yield return new TraeSseEvent(eventName, data.ToJsonString());
                 }
+
+                foreach (var evidenceNode in poll["evidence"]?.AsArray() ?? new JsonArray())
+                    _protocolEvidenceWriter?.Write(evidenceNode);
 
                 string? error = (string?)poll["error"];
                 if (!string.IsNullOrWhiteSpace(error))
@@ -352,13 +361,17 @@ public sealed class TraeIdeBridge
                     JSON.stringify = function(value, ...args) {
                         try {
                             const state = active(), packet = Array.isArray(value?.params) ? value.params[0] : null, params = packet?.params;
-                            if (state && !state.channelId && value?.method === 'request_stream' && params?.service === 'chat' && params?.method === 'chat') {
-                                state.channelId = packet.channel_id;
-                                params.data.model_name = state.configName;
-                                params.data.custom_model = {
-                                    ...(params.data.custom_model || {}), config_name: state.configName,
-                                    display_model_name: state.displayName, is_preset: true, use_remote_service: true
-                                };
+                            if (state && value?.method === 'request_stream' && packet?.channel_id) {
+                                state.captureChannels.add(packet.channel_id);
+                                if (!state.channelId && params?.service === 'chat' && params?.method === 'chat') {
+                                    state.channelId = packet.channel_id;
+                                    params.data.model_name = state.configName;
+                                    params.data.custom_model = {
+                                        ...(params.data.custom_model || {}), config_name: state.configName,
+                                        display_model_name: state.displayName, is_preset: true, use_remote_service: true
+                                    };
+                                }
+                                state.evidence.push({ direction: 'outbound', envelope: value });
                             }
                         } catch (error) {
                             const state = active();
@@ -370,6 +383,8 @@ public sealed class TraeIdeBridge
                         const value = parse.call(this, text, ...args);
                         try {
                             const state = active(), packet = value?.params?.data;
+                            if (state?.captureChannels?.has(packet?.channel_id))
+                                state.evidence.push({ direction: 'inbound', envelope: packet });
                             if (!state?.channelId || packet?.channel_id !== state.channelId) return value;
                             const envelope = packet.params;
                             if (envelope?.code && envelope.code !== 0) {
@@ -418,7 +433,7 @@ public sealed class TraeIdeBridge
                         throw new Error('Another TRAE UI bridge request is active.');
                     bridge.requests.set(bridgeId, {
                         configName: payload.config_name, displayName: payload.display_name,
-                        channelId: null, events: [], itemText: new Map(), done: false, error: null
+                        channelId: null, captureChannels: new Set(), evidence: [], events: [], itemText: new Map(), done: false, error: null
                     });
                     bridge.activeId = bridgeId;
                     const newTask = document.querySelector('button[aria-label^="新建任务"], [role="button"][aria-label^="新建任务"]');
@@ -440,7 +455,8 @@ public sealed class TraeIdeBridge
                     const state = bridge?.requests?.get('{{{{bridgeRequestId}}}}');
           if (!state) return JSON.stringify({ events: [], done: true, error: 'TRAE bridge request state was lost.' });
           const events = state.events.splice(0, state.events.length);
-          const result = JSON.stringify({ events, done: state.done, error: state.error });
+          const evidence = state.evidence.splice(0, state.evidence.length);
+          const result = JSON.stringify({ events, evidence, done: state.done, error: state.error });
                     if (state.done && events.length === 0) {
                         bridge.requests.delete('{{{{bridgeRequestId}}}}');
                         if (bridge.activeId === '{{{{bridgeRequestId}}}}') bridge.activeId = null;

@@ -1,12 +1,82 @@
 using FluentAssertions;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using System.Text.Json.Nodes;
+using TrancnProxy.Agent;
 
 namespace TrancnProxy.Tests;
 
 [TestClass]
 public sealed class TraeModelCatalogTests
 {
+    [TestMethod]
+    public async Task AgentSseReader_PreservesEventOrderingAndMultilinePayloads()
+    {
+        await using var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes("""
+            event: task_created
+            data: {"task_id":"task-1"}
+
+            : keepalive
+            event: thought
+            data: {"delta":"first"}
+            data: {"delta":"second"}
+
+            event: turn_completion
+            data: {"status":"completed"}
+
+            """));
+
+        var frames = new List<TraeAgentSseFrame>();
+        await foreach (var frame in TraeAgentSseReader.ReadAsync(stream)) frames.Add(frame);
+
+        frames.Select(frame => frame.Event).Should().Equal("task_created", "thought", "turn_completion");
+        frames[0].Data.Should().Be("{\"task_id\":\"task-1\"}");
+        frames[1].Data.Should().Be("{\"delta\":\"first\"}\n{\"delta\":\"second\"}");
+    }
+
+    [TestMethod]
+    public void AgentWorkspace_CreateEphemeralUsesVirtualUniqueFileUris()
+    {
+        var first = TraeAgentWorkspace.CreateEphemeral();
+        var second = TraeAgentWorkspace.CreateEphemeral();
+
+        first.RootUri.Scheme.Should().Be(Uri.UriSchemeFile);
+        first.RootUri.AbsolutePath.Should().StartWith("/workspace/");
+        first.ProjectId.Should().NotBe(second.ProjectId);
+        first.WorkspaceId.Should().NotBe(second.WorkspaceId);
+    }
+
+    [TestMethod]
+    public void ProtocolEvidenceSanitizer_RedactsSensitiveValuesAndCorrelatesIdentifiers()
+    {
+        var sanitizer = new TraeProtocolEvidenceSanitizer();
+        var evidence = new JsonObject
+        {
+            ["method"] = "request_stream",
+            ["model_name"] = "glm-5.3__dev",
+            ["session_id"] = "session-private-value",
+            ["authorization"] = "Bearer private-token",
+            ["messages"] = new JsonArray(new JsonObject
+            {
+                ["content"] = "private prompt",
+                ["user_id"] = "private-user"
+            }),
+            ["nested"] = new JsonObject { ["task_id"] = "session-private-value" }
+        };
+
+        var sanitized = sanitizer.Sanitize(evidence)!.AsObject();
+        string serialized = sanitized.ToJsonString();
+
+        serialized.Should().NotContain("private-token");
+        serialized.Should().NotContain("private prompt");
+        serialized.Should().NotContain("private-user");
+        serialized.Should().NotContain("session-private-value");
+        sanitized["method"]!.GetValue<string>().Should().Be("request_stream");
+        sanitized["model_name"]!.GetValue<string>().Should().Be("glm-5.3__dev");
+        sanitized["session_id"]!.GetValue<string>().Should().StartWith("id_");
+        sanitized["nested"]!["task_id"]!.GetValue<string>().Should().Be(sanitized["session_id"]!.GetValue<string>());
+        sanitized["messages"]![0]!["content"]!.GetValue<string>().Should().Be("[redacted]");
+    }
+
     [TestMethod]
     public void Parse_ReturnsExactVisibleTargetModelIds()
     {

@@ -3,6 +3,8 @@
 > Trae CN(企业版)→ OpenAI / Anthropic 兼容 API 网关
 > 状态:**动态模型目录与 TRAE IDE Agent bridge 已验证通过**
 
+> 2026-08-27 起，IDE bridge 只保留为开发期协议对照。独立 headless Agent 传输尚未通过真实验收，不能作为 Docker 或生产部署能力声明。
+
 ---
 
 ## 1. 已验证的可行性结论(2026-08-25 实测)
@@ -94,12 +96,21 @@ console.enterprise.trae.cn(上游,经企业代理)
 - 可选模型对话通过当前 TRAE IDE Agent 执行；首次请求安装初始化 hook 并重载 workbench，请求串行化，实际模型 metadata 必须与请求 ID 一致。
 - **待增强**:tool_use/tool_result 结构化往返(参考 laojichao 项目的 `<tool_call>` 解析策略)、reasoning_content 与 response 的分离输出、Anthropic 严格交错校验(role 交替)。
 
-### 3.5 TokenRefreshService(已实现,待实测)
+### 3.5 开发期协议证据(进行中)
+- 使用 `--protocol-evidence-dir /tmp/trae-protocol-evidence` 执行一次普通 Agent 的“新建会话 -> 首条纯文本消息”取证；目录不能位于工作区内。
+- bridge 只捕获活动请求关联的 Aha `request_stream` 出入站 envelope。落盘前执行 schema 投影：保留事件、方法、服务、模型、数值与布尔值；同次 ID 使用随机盐伪匿名化；token、用户、设备、路径和消息内容一律替换。
+- 每次录制后扫描 JSONL，人工把必要的字段结构转为合成 fixture。原始录制、HAR、用户消息、客户端 bundle 和二进制均不得提交。
+- 取证目标是确认真实会话创建路径、服务端返回的 `session_id/project_id`、后续 Agent 请求路径/字段，以及 SSE 事件顺序。证据缺失时不得猜测随机 session ID。
+- **当前硬门禁未通过**：静态交叉检查确认 CUE HTTP 端点只有 `create_agent_task` 和 `commit_toolcall_result`；`chat/create_new_session` 是本地 Aha IPC。native `ai-agent` 模块包含 `create_lite_session`、本地 `chat_session` 存储和工作树创建符号，尚无可验证的远端 create-session HTTP 契约。随机 session ID 已被上游以“session not found”拒绝。
+- 已实现独立的 .NET `TraeAgentClient`：复用账号 HTTP 鉴权/代理，调用已确认的 task endpoint 并按标准 SSE 分帧；`TraeAgentSessionRunner` 强制 server-issued session、模型 metadata 先于 output，且要求明确终止事件。这些组件不引用 Electron、CDP、Aha 或 TRAE 本地目录。
+- **不采用 UI 作为会话前置条件**：若后续获得并验证远端会话契约，headless transport 才自动请求 session，并生成或使用管理员配置的 workspace descriptor。普通文本聊天不要求用户打开 IDE 目录；只有显式启用文件工具时，才允许服务端挂载并传递受控工作目录。
+
+### 3.6 TokenRefreshService(已实现,待实测)
 - 周期 30 分钟;`expiredAt - 1h` 触发 `ExchangeToken`;成功后缓存 + 回写。
 - refresh 到期(`refreshExpiredAt`)前 7 天告警;彻底过期 → 走登录引导。
 - **风险点**:ExchangeToken 会轮换 token。需实测确认:轮换后 IDE 在线会话是否受影响(预期:IDE 下次请求 401 后自行用新 refresh 恢复,或直接读回写的 storage.json)。
 
-### 3.6 登录引导(独立网页授权,已实现,待完整走通)
+### 3.7 登录引导(独立网页授权,已实现,待完整走通)
 完全逆向自 IDE 的 `loginUrlBuilder.js` / `saas/oauthService.js`:
 
 1. 本地 `127.0.0.1:<随机端口>` 起回调服务器(路由 `/authorize`)
@@ -111,7 +122,7 @@ console.enterprise.trae.cn(上游,经企业代理)
 独立会话标记 `Standalone=true`:刷新只更新缓存,**不写 IDE 的 storage.json**,与 IDE 会话互不干扰。
 `--weblogin` 强制走此流程;`--login` 仍从 IDE storage.json 读取。
 
-### 3.7 多账号运行时(已实现基础版)
+### 3.8 多账号运行时(已实现基础版)
 - 对外仍是单个 `/v1` API；内部 `MultiAccountManager` 管理多个 Trae 账号，按 `priority` 或 `balanced` 策略选择账号。
 - 请求开始时获得固定 `AccountLease`，流式输出开始后不切换账号；每账号有独立 `TraeClient`、刷新锁和并发上限。
 - 会话粘滞键来自 `X-Trancn-Session-Id`、OpenAI/Responses `user` 或 Anthropic `metadata.user_id`，默认有效期一小时。
@@ -119,7 +130,7 @@ console.enterprise.trae.cn(上游,经企业代理)
 - 管理端为 `/admin`，账号 JSON 导入与网页登录使用独立 `TRANCN_ADMIN_KEY`；网页登录回调有 PKCE、随机 state 和五分钟有效期保护。
 - 详细设计与实施计划见 [multi-account-design.md](multi-account-design.md) 和 [multi-account-implementation-plan.md](multi-account-implementation-plan.md)。
 
-### 3.8 安全设计(针对多人共享)
+### 3.9 安全设计(针对多人共享)
 | 项 | 设计 |
 |----|------|
 | 服务配置 | `appsettings.json` 保存监听地址、端口、业务 Key、管理 Key、账号目录和 OAuth 回调地址；命令行与环境变量可覆盖对应项 |

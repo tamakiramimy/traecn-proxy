@@ -30,16 +30,40 @@ public class TraeClient
     private readonly TraeAuthData _auth;
     private readonly TraeModelCatalogCache _modelCatalog;
 
-    public TraeClient(TraeAuthData auth, string? deviceId = null, string? machineId = null)
+    public TraeClient(
+        TraeAuthData auth,
+        string? deviceId = null,
+        string? machineId = null,
+        HttpMessageHandler? httpMessageHandler = null)
     {
         _auth = auth;
         _apiHost = string.IsNullOrWhiteSpace(auth.ApiHost) ? "https://console.enterprise.trae.cn" : auth.ApiHost!;
         (_deviceId, _machineId) = (deviceId ?? "0", machineId ?? "0");
-        _http = BuildHttpClient();
+        _http = httpMessageHandler is null
+            ? BuildHttpClient()
+            : new HttpClient(httpMessageHandler, disposeHandler: false) { Timeout = TimeSpan.FromMinutes(10) };
         _modelCatalog = new TraeModelCatalogCache(FetchModelCatalogAsync);
     }
 
     public string ApiHost => _apiHost;
+
+    /// <summary>Sends a JSON request with the authenticated TRAE client headers and proxy configuration.</summary>
+    public Task<HttpResponseMessage> SendJsonAsync(
+        HttpMethod method,
+        string relativePath,
+        JsonNode body,
+        HttpCompletionOption completionOption = HttpCompletionOption.ResponseContentRead,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(method);
+        ArgumentException.ThrowIfNullOrWhiteSpace(relativePath);
+        ArgumentNullException.ThrowIfNull(body);
+
+        var request = new HttpRequestMessage(method, new Uri(new Uri(_apiHost.TrimEnd('/') + "/"), relativePath.TrimStart('/')));
+        AddHeaders(request);
+        request.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
+        return _http.SendAsync(request, completionOption, cancellationToken);
+    }
 
     private static HttpClient BuildHttpClient()
     {

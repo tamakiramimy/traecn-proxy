@@ -23,12 +23,7 @@ string accountAlias = "default";
 string? dataDirectory = EmptyToNull(settings.Accounts.DataDirectory);
 string? importPath = null;
 string? publicBaseUrl = Environment.GetEnvironmentVariable("TRANCN_PUBLIC_BASE_URL") ?? EmptyToNull(settings.Server.PublicBaseUrl);
-var ideBridge = settings.IdeBridge.Enabled
-    ? new TraeIdeBridge(
-        settings.IdeBridge.DebugEndpoint,
-        TimeSpan.FromSeconds(Math.Max(1, settings.IdeBridge.RequestTimeoutSeconds)),
-        TimeSpan.FromMilliseconds(Math.Max(10, settings.IdeBridge.PollIntervalMilliseconds)))
-    : null;
+string? protocolEvidenceDirectory = null;
 for (int i = 0; i < argsList.Count; i++)
 {
     if (argsList[i] == "--port" && i + 1 < argsList.Count) port = int.Parse(argsList[++i]);
@@ -39,7 +34,24 @@ for (int i = 0; i < argsList.Count; i++)
     else if (argsList[i] == "--data-dir" && i + 1 < argsList.Count) dataDirectory = argsList[++i];
     else if (argsList[i] == "--account-import" && i + 1 < argsList.Count) importPath = argsList[++i];
     else if (argsList[i] == "--public-base-url" && i + 1 < argsList.Count) publicBaseUrl = argsList[++i];
+    else if (argsList[i] == "--protocol-evidence-dir" && i + 1 < argsList.Count) protocolEvidenceDirectory = argsList[++i];
 }
+
+if (!string.IsNullOrWhiteSpace(protocolEvidenceDirectory) && IsWithinCurrentWorkspace(protocolEvidenceDirectory))
+{
+    Console.Error.WriteLine("协议证据目录必须位于当前工作区外，例如 /tmp/trae-protocol-evidence。");
+    return 1;
+}
+using var protocolEvidenceWriter = string.IsNullOrWhiteSpace(protocolEvidenceDirectory)
+    ? null
+    : new TraeProtocolEvidenceWriter(Path.GetFullPath(protocolEvidenceDirectory));
+var ideBridge = settings.IdeBridge.Enabled
+    ? new TraeIdeBridge(
+        settings.IdeBridge.DebugEndpoint,
+        TimeSpan.FromSeconds(Math.Max(1, settings.IdeBridge.RequestTimeoutSeconds)),
+        TimeSpan.FromMilliseconds(Math.Max(10, settings.IdeBridge.PollIntervalMilliseconds)),
+        protocolEvidenceWriter)
+    : null;
 
 if (argsList.Remove("--tc-test"))
 {
@@ -442,6 +454,14 @@ return 0;
 // ==================== helpers ====================
 
 string? EmptyToNull(string? value) => string.IsNullOrWhiteSpace(value) ? null : value;
+
+bool IsWithinCurrentWorkspace(string candidateDirectory)
+{
+    string workspace = Path.GetFullPath(Directory.GetCurrentDirectory()).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+    string candidate = Path.GetFullPath(candidateDirectory);
+    return string.Equals(candidate, workspace, StringComparison.Ordinal) ||
+           candidate.StartsWith(workspace + Path.DirectorySeparatorChar, StringComparison.Ordinal);
+}
 
 string? SessionKey(HttpContext ctx, JsonObject body)
 {

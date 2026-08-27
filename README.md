@@ -8,6 +8,8 @@
 
 - 可选模型通过当前运行中的 TRAE IDE Agent 调用，而不是旧的 `llm_utils_chat` HTTP 端点。TRAE 必须使用 `--remote-debugging-port=9333` 启动并保持登录。
 - 首次 Agent 请求会自动安装页面初始化 hook 并重载一次 TRAE workbench。请求通过同一个 IDE UI 串行执行，并会在 TRAE 中创建对应任务记录。
+- 独立 headless Agent 协议仍处于取证与可行性验证阶段，尚未通过真实验收；当前 bridge 不能作为 Linux Docker 部署方案。
+- `llm_utils_chat` 可以直接以 HTTP/SSE 对话，但已验证它会忽略指定模型并回退，因此不能承载精确选模。项目已实现纯 .NET 的 CUE Agent task SSE 客户端和模型确认状态机，但远端 session 创建契约尚未验证；调用者无需打开目录或操作 TRAE UI，尚未通过该闸门前也不会将 Docker headless 声称为可用。
 - Agent bridge 始终使用当前 TRAE IDE 登录账号。账号池的会话粘滞和负载均衡不会切换 bridge 身份；请求模型不属于当前 IDE 账号时会明确失败。
 - 代理会校验 TRAE 返回的实际模型 metadata。实际模型与请求 ID 不一致时返回 `model_selection_mismatch`，不会静默回退到其他模型。
 - 仅验证了基础文本对话。工具调用、复杂多模态输入、完整 Anthropic 交错消息规则及思考内容分离尚未实现。
@@ -85,9 +87,20 @@ dotnet run
 | `--account-import <file>` | 导入单个账号或账号数组 JSON 文件 |
 | `--data-dir <path>` | 覆盖账号库目录，默认 `~/.config/trancn-proxy` |
 | `--public-base-url <url>` | OAuth 回调对浏览器可访问的服务根地址 |
+| `--protocol-evidence-dir <path>` | 开发期协议取证目录；必须位于当前工作区外，仅写入脱敏 JSONL |
 | `--tc-test` | 校验本地 `tc` 加解密实现 |
 
 网关 Key 也可由 `TRANCN_API_KEY` 环境变量提供。管理端使用独立的 `TRANCN_ADMIN_KEY`。企业网络需要代理时，程序会读取 `HTTPS_PROXY` 或 `HTTP_PROXY`。
+
+## 开发期协议取证
+
+该开关仅用于开发阶段确认普通 Agent 的真实会话创建和流式协议，不属于生产部署能力。以带调试端口的 TRAE 启动后，使用一次无敏感内容的短消息：
+
+```bash
+dotnet run -- --protocol-evidence-dir /tmp/trae-protocol-evidence
+```
+
+bridge 会记录活动请求关联的 Aha `request_stream` 出入站 envelope。文件保存在指定目录，内容仅保留字段结构、事件、方法、模型和同次运行可关联的伪匿名 ID；token、用户、设备、路径、消息正文和其他字符串值会被移除或替换。录制完成后应先扫描文件确认没有敏感信息，再将合成/脱敏 fixture 提交到测试目录。不要提交原始 HAR、TRAE 二进制、bundle 或录制文件。
 
 ## 多账号与管理端
 
