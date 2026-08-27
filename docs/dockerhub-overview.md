@@ -4,6 +4,8 @@
 >
 > Unofficial experimental project. Exposes an authorized Trae CN enterprise account through a minimal OpenAI / Anthropic compatible API.
 
+**容器独立运行，不需要安装或启动 Trae CN IDE。** 在管理台完成网页 OAuth 授权后，代理直接以 HTTP/SSE 调用上游对话接口。
+
 - **源码 / Issue / Release**：<https://github.com/tamakiramimy/traecn-proxy>
 - **镜像构建**：由仓库的 [Release workflow](https://github.com/tamakiramimy/traecn-proxy/blob/main/.github/workflows/release.yml) 基于 GitHub Release 中的 .NET 8 自包含产物自动构建
 - **许可证**：[MIT](https://github.com/tamakiramimy/traecn-proxy/blob/main/LICENSE)
@@ -13,7 +15,7 @@
 | 标签 | 说明 |
 | --- | --- |
 | `latest` | 最新正式版本 |
-| `0.3.1`、`0.3` | 具体版本 / 次版本浮动标签 |
+| `0.4.1`、`0.4` | 具体版本 / 次版本浮动标签 |
 
 架构：`linux/amd64`、`linux/arm64`。
 
@@ -31,16 +33,16 @@ docker pull ghcr.io/tamakiramimy/traecn-proxy:latest
 
 限制：
 
-- 容器内没有 Trae CN IDE，镜像默认关闭 `IdeBridge`，**依赖 IDE Agent bridge 的能力不可用**（该协议仍在取证阶段）。
 - SOLO / 消费版服务面（`solo_work_lite`）按 `config_name` 选模，与企业面的 `__dev` / `__max` ID 不通用；该面在容器内尚未做完整回归。
 - 仅验证了基础文本对话；工具调用、多模态、完整 Anthropic 交错消息规则尚未实现。
+- 镜像内默认关闭 `IdeBridge`，它只服务于开发期协议取证，不影响对话链路。
 - 本项目与 Trae、字节跳动无隶属关系。使用前请确认符合组织 IT 政策、账号授权范围与服务条款。
 
 ## 快速开始
 
 ```bash
 docker run -d --name trancn-proxy \
-  -p 9220:9220 \
+  -p 127.0.0.1:9220:9220 \
   -v trancn-data:/data \
   -e TRANCN_API_KEY=替换为强随机网关密钥 \
   -e TRANCN_ADMIN_KEY=替换为强随机管理密钥 \
@@ -65,7 +67,7 @@ curl -H "Authorization: Bearer $TRANCN_API_KEY" http://127.0.0.1:9220/v1/models
 | --- | --- | --- |
 | `Server.Listen` | `0.0.0.0` | 容器需要对外暴露端口 |
 | `Accounts.DataDirectory` | `/data` | 账号库落在数据卷上 |
-| `IdeBridge.Enabled` | `false` | 容器内不存在 Trae CN IDE |
+| `IdeBridge.Enabled` | `false` | 开发期取证通道，对话链路用不到 |
 
 - 端口：`9220`
 - 数据卷：`/data`（`accounts.json`、`instance.lock` 等）

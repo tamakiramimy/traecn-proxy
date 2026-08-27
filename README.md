@@ -2,18 +2,22 @@
 
 > 非官方实验项目。将已获授权的 Trae CN 企业账号接入为基础 OpenAI / Anthropic 兼容 API。
 
-`trancn-proxy` 读取本机 Trae CN 登录状态，通过本地 HTTP 服务转发文本对话请求，便于接入兼容 OpenAI 或 Anthropic API 的工具。
+`trancn-proxy` **独立运行，不需要安装或启动 Trae CN IDE**：通过网页 OAuth 授权拿到企业账号凭据后，直接以 HTTP/SSE 调用上游对话接口，对外提供 OpenAI / Anthropic 兼容 API。也可以从本机已登录的 Trae CN 导入账号。
+
+## 当前能力
+
+- 对话走企业控制面 `chat_v3` 通道直连上游，**精确选模有效**：代理会校验上游回传的实际模型 metadata，不一致时返回 `model_selection_mismatch`，不会静默回退到其他模型。
+- 支持多账号池（网页登录逐个添加）、会话粘滞、优先级/并发均衡调度、Token 自动刷新。
+- 已在 Linux 容器中实测可用：模型目录、精确选模、OpenAI / Anthropic 端点、流式输出、管理端逐模型测试。
 
 ## 已知限制
 
-- 可选模型通过当前运行中的 TRAE IDE Agent 调用，而不是旧的 `llm_utils_chat` HTTP 端点。TRAE 必须使用 `--remote-debugging-port=9333` 启动并保持登录。
-- 首次 Agent 请求会自动安装页面初始化 hook 并重载一次 TRAE workbench。请求通过同一个 IDE UI 串行执行，并会在 TRAE 中创建对应任务记录。
-- 独立 headless Agent 协议仍处于取证与可行性验证阶段，尚未通过真实验收；当前 bridge 不能作为 Linux Docker 部署方案。
-- `llm_utils_chat` 可以直接以 HTTP/SSE 对话，但已验证它会忽略指定模型并回退，因此不能承载精确选模。项目已实现纯 .NET 的 CUE Agent task SSE 客户端和模型确认状态机，但远端 session 创建契约尚未验证；调用者无需打开目录或操作 TRAE UI，尚未通过该闸门前也不会将 Docker headless 声称为可用。
-- Agent bridge 始终使用当前 TRAE IDE 登录账号。账号池的会话粘滞和负载均衡不会切换 bridge 身份；请求模型不属于当前 IDE 账号时会明确失败。
-- 代理会校验 TRAE 返回的实际模型 metadata。实际模型与请求 ID 不一致时返回 `model_selection_mismatch`，不会静默回退到其他模型。
 - 仅验证了基础文本对话。工具调用、复杂多模态输入、完整 Anthropic 交错消息规则及思考内容分离尚未实现。
-- macOS 已实测。Windows 发布包可用，但 Trae CN 的本地数据读取尚未完成端到端验证。
+- SOLO / 消费版服务面（`solo_work_lite`）按 `config_name` 选模，与企业面的 `__dev` / `__max` ID 不通用，尚未做完整回归。
+- 账号类型目前只支持显式声明与按 `Upstream:ChatApiHost` 推断，尚未实现按租户信息推断或端点探测兜底。
+- IDE Bridge 已不参与对话，仅保留给开发期协议取证（见下文），需要 TRAE 以 `--remote-debugging-port=9333` 启动才可用；`GET /v1/status` 的 `ide_bridge` 字段仅反映该取证通道状态。
+- macOS 与 Linux 容器已实测。Windows 发布包可用，但 Trae CN 的本地数据读取尚未完成端到端验证。
+- 本项目与 Trae、字节跳动无隶属关系。使用前请确认符合组织 IT 政策、账号授权范围与服务条款。
 
 完整的调研与协议说明见 [docs/design.md](docs/design.md)。
 
@@ -25,6 +29,7 @@
 - `trancn-proxy-v*-osx-x64.zip`：Intel Mac
 - `trancn-proxy-v*-win-x64.zip`：Windows x64
 - `trancn-proxy-v*-win-arm64.zip`：Windows ARM64
+- `trancn-proxy-v*-linux-x64.zip` / `trancn-proxy-v*-linux-arm64.zip`：Linux
 
 解压后运行 `trancn-proxy`（Windows 为 `trancn-proxy.exe`）。macOS 首次运行如被系统拦截，可在确认来源可信后移除隔离属性：
 
@@ -33,14 +38,20 @@ xattr -dr com.apple.quarantine trancn-proxy
 ./trancn-proxy
 ```
 
+首次启动没有账号时会自动打开浏览器完成 Trae CN 网页授权；也可以显式指定：
+
+```bash
+./trancn-proxy --weblogin          # 独立网页授权，不依赖 Trae CN IDE
+./trancn-proxy --login             # 从本机已登录的 Trae CN 导入账号
+```
+
+设置了 `TRANCN_ADMIN_KEY` 时，零账号也会直接启动服务，改为在 `/admin` 网页里添加账号（远程与容器部署用这种方式）。
+
 也可从源码运行，需安装 .NET 8 SDK：
 
 ```bash
-open -a "Trae CN" --args --remote-debugging-port=9333
 dotnet run
 ```
-
-如果 TRAE 已在运行，请先完全退出后再用上述参数启动。可通过 `GET /v1/status` 的 `ide_bridge.available` 确认 bridge 是否就绪。
 
 ## Docker
 
@@ -61,11 +72,11 @@ docker run -d --name trancn-proxy \
   tamakiramimy/traecn-proxy:0.4.1
 ```
 
-镜像内的 `appsettings.json` 已将 `Server.Listen` 设为 `0.0.0.0`、`Accounts.DataDirectory` 设为 `/data`，并关闭 IdeBridge（容器内没有 Trae CN IDE）。请务必通过环境变量覆盖默认密钥，不要在未鉴权的情况下把端口暴露到公网。
+镜像内的 `appsettings.json` 已将 `Server.Listen` 设为 `0.0.0.0`、`Accounts.DataDirectory` 设为 `/data`，并关闭 IdeBridge（只服务于开发期取证，对话用不到）。请务必通过环境变量覆盖默认密钥，不要在未鉴权的情况下把端口暴露到公网。
 
 容器里不走 CLI 授权（回调会落到容器内的 `127.0.0.1`，宿主浏览器不可达）。启动后直接打开 <http://127.0.0.1:9220/admin> ，用 `TRANCN_ADMIN_KEY` 连接，在「添加网页登录账号」里完成 Trae CN 授权；重复该步骤可添加多个账号。
 
-已在容器内实测可用（企业账号、`chat_v3` 通道）：模型目录、精确选模、OpenAI / Anthropic 端点、流式输出。依赖 IDE Agent bridge 的能力在容器内不可用。
+已在容器内实测可用（企业账号、`chat_v3` 通道）：模型目录、精确选模、OpenAI / Anthropic 端点、流式输出、管理端逐模型测试。
 
 自行构建镜像（基于 Release 中的自包含产物）：
 
@@ -105,6 +116,8 @@ docker buildx build --platform linux/amd64,linux/arm64 `
 
 `Accounts:DataDirectory` 留空时使用 `~/.config/trancn-proxy`。覆盖优先级为：命令行参数最高，其次是环境变量，最后是 `appsettings.json`。环境变量 `TRANCN_API_KEY`、`TRANCN_ADMIN_KEY`、`TRANCN_PUBLIC_BASE_URL` 分别覆盖对应配置项。
 
+`IdeBridge` 只服务于开发期协议取证，对话链路不会用到它；不做取证时可以设为 `false`（Docker 镜像内已默认关闭）。
+
 ## 服务面与账号类型
 
 上游有两套不兼容的服务面，每个账号由 `accounts.json` 中的 `kind` 字段决定用哪一套：
@@ -142,7 +155,7 @@ docker buildx build --platform linux/amd64,linux/arm64 `
 | `--login` | 强制从 Trae CN 本地存储重新读取授权 |
 | `--weblogin` | 使用独立网页授权，不依赖 Trae CN IDE |
 | `--test` | 发送一条真实对话自测 |
-| `--model <model>` | 配合 `--test` 指定模型，默认 `Doubao-Seed-Evolving` |
+| `--model <model>` | 配合 `--test` 指定模型，缺省时用当前账号服务面的默认模型 |
 | `--account <alias>` | 指定网页登录、IDE 导入或自测使用的账号别名，默认 `default` |
 | `--account-list` | 列出本地已保存的账号 |
 | `--account-import <file>` | 导入单个账号或账号数组 JSON 文件 |
@@ -155,9 +168,12 @@ docker buildx build --platform linux/amd64,linux/arm64 `
 
 ## 开发期协议取证
 
-该开关仅用于开发阶段确认普通 Agent 的真实会话创建和流式协议，不属于生产部署能力。以带调试端口的 TRAE 启动后，使用一次无敏感内容的短消息：
+## 开发期协议取证
+
+该开关仅用于开发阶段确认 IDE Agent 的真实会话创建和流式协议，不属于生产部署能力，也不影响正常对话链路。需要以带调试端口的 TRAE 启动后，使用一次无敏感内容的短消息：
 
 ```bash
+open -a "Trae CN" --args --remote-debugging-port=9333
 dotnet run -- --protocol-evidence-dir /tmp/trae-protocol-evidence
 ```
 
@@ -165,9 +181,9 @@ bridge 会记录活动请求关联的 Aha `request_stream` 出入站 envelope。
 
 ## 多账号与管理端
 
-代理对外仍只提供一个 `/v1` 入口，账号池用于模型目录、授权维护和旧 HTTP 路径。可选 Agent 模型的实际推理由当前 TRAE IDE 登录账号执行，同一时间只处理一个 bridge 请求。
+代理对外只提供一个 `/v1` 入口。每个请求在完整响应周期内锁定一个账号，模型目录、对话与授权维护都走该账号自己的凭据，不依赖任何 IDE 登录态。
 
-账号库位于 `accounts.json`，首次运行会自动迁移旧的 `auth.json` 为 `default` 账号。JSON 可通过 `--account-import` 或管理端导入。多账号推荐使用独立网页授权，避免与 IDE 登录态竞争 refresh token。
+账号库位于 `accounts.json`，首次运行会自动迁移旧的 `auth.json` 为 `default` 账号。JSON 可通过 `--account-import` 或管理端导入。多账号推荐使用网页授权逐个添加，避免与 IDE 登录态竞争 refresh token。
 
 设置 `TRANCN_ADMIN_KEY` 后访问 `http://127.0.0.1:9220/admin`。管理端支持账号列表、JSON 导入、启停、刷新、Token 校验、逐模型测试对话、删除和 Trae 网页登录。模型测试会向所选模型发送一句「请回复&lt;模型名&gt;」并回显上游实际模型，用于确认该账号在该模型上可用。远程部署网页登录时必须配置浏览器可访问的 `--public-base-url https://proxy.example.com`。
 
@@ -178,7 +194,7 @@ base_url: http://trancn-proxy:9220/v1
 api_key: <TRANCN_API_KEY>
 ```
 
-建议先请求 `/v1/models` 获取当前账号的精确 ID。2026-08-27 已实测：
+建议先请求 `/v1/models` 获取当前账号的精确 ID。2026-08-28 已在 Linux 容器内实测：
 
 - `glm-5.3__dev`
 - `DeepSeek-V4-Pro-Official__dev`
