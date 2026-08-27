@@ -3,3 +3,4 @@ obj/
 logs/
 *.user
 .DS_Store
+.artifacts/

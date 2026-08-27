@@ -1,0 +1,2 @@
+# Docker Hub 的 description API 会因 CRLF 行尾返回 500，overview 必须保持 LF
+docs/dockerhub-overview.md text eol=lf

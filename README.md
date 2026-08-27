@@ -42,6 +42,36 @@ dotnet run
 
 如果 TRAE 已在运行，请先完全退出后再用上述参数启动。可通过 `GET /v1/status` 的 `ide_bridge.available` 确认 bridge 是否就绪。
 
+## Docker
+
+多架构镜像（`linux/amd64`、`linux/arm64`）已发布到 Docker Hub，自下一个 Release 起同时发布到 GitHub Container Registry：
+
+```bash
+docker pull tamakiramimy/traecn-proxy:latest
+# Docker Hub 拉取失败时的备用源
+docker pull ghcr.io/tamakiramimy/traecn-proxy:latest
+```
+
+```bash
+docker run -d --name trancn-proxy \
+  -p 9220:9220 \
+  -v trancn-data:/data \
+  -e TRANCN_API_KEY=请替换为你的网关密钥 \
+  -e TRANCN_ADMIN_KEY=请替换为你的管理密钥 \
+  tamakiramimy/traecn-proxy:0.3.1
+```
+
+镜像内的 `appsettings.json` 已将 `Server.Listen` 设为 `0.0.0.0`、`Accounts.DataDirectory` 设为 `/data`，并关闭 IdeBridge（容器内没有 Trae IDE，仅走 Standalone 模式）。首次启动会在日志中打印网页授权地址，复制到浏览器完成登录后，凭据保存在 `/data` 卷中。请务必通过环境变量覆盖默认密钥，不要在未鉴权的情况下把端口暴露到公网。
+
+自行构建镜像（基于 Release 中的自包含产物）：
+
+```powershell
+pwsh scripts/prepare-docker-artifacts.ps1 -Version v0.3.1
+docker buildx build --platform linux/amd64,linux/arm64 `
+  --build-arg VERSION=0.3.1 `
+  -t <账号>/traecn-proxy:0.3.1 --push .
+```
+
 ## 配置
 
 启动目录中的 `appsettings.json` 用于服务配置，发布产物会自带不含密钥的默认文件：
