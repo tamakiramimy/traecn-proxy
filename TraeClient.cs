@@ -28,7 +28,7 @@ public class TraeClient
     private readonly string _deviceId;
     private readonly string _machineId;
     private readonly TraeAuthData _auth;
-    private JsonNode? _modelCatalog;
+    private readonly TraeModelCatalogCache _modelCatalog;
 
     public TraeClient(TraeAuthData auth, string? deviceId = null, string? machineId = null)
     {
@@ -36,6 +36,7 @@ public class TraeClient
         _apiHost = string.IsNullOrWhiteSpace(auth.ApiHost) ? "https://console.enterprise.trae.cn" : auth.ApiHost!;
         (_deviceId, _machineId) = (deviceId ?? "0", machineId ?? "0");
         _http = BuildHttpClient();
+        _modelCatalog = new TraeModelCatalogCache(FetchModelCatalogAsync);
     }
 
     public string ApiHost => _apiHost;
@@ -105,10 +106,22 @@ public class TraeClient
         catch { return false; }
     }
 
-    /// <summary>企业模型目录(chat_v3 函数配置),用于 /v1/models。</summary>
-    public async Task<JsonNode> GetModelCatalogAsync(bool force = false, CancellationToken ct = default)
+    /// <summary>Gets the selectable enterprise <c>chat_v3</c> model catalog.</summary>
+    /// <param name="force">Forces an upstream refresh.</param>
+    /// <param name="ct">Cancels catalog loading.</param>
+    /// <returns>The current account's model catalog.</returns>
+    public Task<TraeModelCatalogSnapshot> GetModelCatalogAsync(bool force = false, CancellationToken ct = default) =>
+        _modelCatalog.GetAsync(force, ct);
+
+    /// <summary>Resolves an exact model ID in the current account's catalog.</summary>
+    /// <param name="modelId">The exact upstream model ID.</param>
+    /// <param name="ct">Cancels catalog loading.</param>
+    /// <returns>The matching model descriptor.</returns>
+    public Task<TraeModelDescriptor> ResolveModelAsync(string modelId, CancellationToken ct = default) =>
+        _modelCatalog.ResolveAsync(modelId, ct);
+
+    private async Task<JsonNode> FetchModelCatalogAsync(CancellationToken ct)
     {
-        if (!force && _modelCatalog != null) return _modelCatalog;
         var body = new JsonObject
         {
             ["functions"] = new JsonArray("chat_v3", "chat", "inline_chat"),
@@ -125,8 +138,9 @@ public class TraeClient
         req.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
         using var resp = await _http.SendAsync(req, ct);
         resp.EnsureSuccessStatusCode();
-        _modelCatalog = JsonNode.Parse(await resp.Content.ReadAsStringAsync(ct));
-        return _modelCatalog!;
+        string responseBody = await resp.Content.ReadAsStringAsync(ct);
+        return JsonNode.Parse(responseBody)
+            ?? throw new TraeModelCatalogException("TRAE model catalog response is empty.");
     }
 
     public IAsyncEnumerable<TraeSseEvent> ChatStreamAsync(
