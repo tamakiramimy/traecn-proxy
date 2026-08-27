@@ -101,6 +101,33 @@ docker buildx build --platform linux/amd64,linux/arm64 `
 
 `Accounts:DataDirectory` 留空时使用 `~/.config/trancn-proxy`。覆盖优先级为：命令行参数最高，其次是环境变量，最后是 `appsettings.json`。环境变量 `TRANCN_API_KEY`、`TRANCN_ADMIN_KEY`、`TRANCN_PUBLIC_BASE_URL` 分别覆盖对应配置项。
 
+## 服务面与账号类型
+
+上游有两套不兼容的服务面，每个账号由 `accounts.json` 中的 `kind` 字段决定用哪一套：
+
+| `kind` | chat 通道 | 模型目录端点 | 模型 ID 语义 |
+| --- | --- | --- | --- |
+| `enterprise` | `chat_v3` | `/api/ide/v1/batch_get_detail_param` | `model` 与 `config_name` 分离（如 `glm-5.3__dev` / `glm-5.3`） |
+| `solo` | `solo_work_lite` | `/api/ide/v1/get_detail_param` | 两者都用 `config_name` |
+| `auto`（默认） | 按是否配置了独立 `Upstream:ChatApiHost` 推断 | | |
+
+同一个账号池里可以混用两种类型，各自使用自己的通道、目录与默认模型，互不影响。`Upstream:DefaultAccountKind` 决定新建账号的默认类型。
+
+客户端画像（版本号、设备品牌、OS 版本）已可配置，上游要求新版本时改配置即可，不必重新发版：
+
+```json
+{
+	"Upstream": {
+		"ChatApiHost": "",
+		"DefaultAccountKind": "auto",
+		"Enterprise": { "IdeVersion": "3.3.87", "IdeVersionCode": "20260806" },
+		"Solo": { "IdeVersion": "0.1.43", "IdeVersionCode": "20260716", "DeviceBrand": "83DG" }
+	}
+}
+```
+
+留空的字段沿用内置默认值；企业面的设备信息默认取本机环境，SOLO 面固定使用该服务接受的 SOLO 客户端形态。
+
 ## 命令行参数
 
 | 参数 | 说明 |

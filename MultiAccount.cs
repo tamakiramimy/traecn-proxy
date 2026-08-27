@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace TrancnProxy;
 
@@ -12,6 +13,11 @@ public sealed class TraeAccount
     public int MaxConcurrency { get; set; } = 1;
     public string DeviceId { get; set; } = "0";
     public string MachineId { get; set; } = "0";
+
+    /// <summary>账号所属服务面，<see cref="TraeAccountKind.Auto"/> 时由上游配置推断。</summary>
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public TraeAccountKind Kind { get; set; } = TraeAccountKind.Auto;
+
     public TraeAuthData Auth { get; set; } = new();
     public DateTimeOffset? LastUsedAt { get; set; }
     public DateTimeOffset? LastSuccessAt { get; set; }
@@ -112,10 +118,16 @@ internal sealed class TraeAccountRuntime
 {
     private int _inFlight;
 
-    public TraeAccountRuntime(TraeAccount account, string? chatApiHost)
+    public TraeAccountRuntime(TraeAccount account, TraeUpstreamOptions? upstream)
     {
         Account = account;
-        Client = new TraeClient(account.Auth, account.DeviceId, account.MachineId, chatApiHost: chatApiHost);
+        Client = new TraeClient(
+            account.Auth,
+            account.DeviceId,
+            account.MachineId,
+            chatApiHost: upstream?.ChatApiHost,
+            accountKind: account.Kind,
+            upstreamOptions: upstream);
     }
 
     public TraeAccount Account { get; }
@@ -143,18 +155,18 @@ internal sealed class TraeAccountRuntime
 public sealed class MultiAccountManager
 {
     private readonly TraeAccountStore _store;
-    private readonly string? _chatApiHost;
+    private readonly TraeUpstreamOptions? _upstream;
     private readonly object _selectionGate = new();
     private readonly ConcurrentDictionary<string, TraeAccountRuntime> _accounts = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, SessionBinding> _sessions = new(StringComparer.Ordinal);
 
-    public MultiAccountManager(TraeAccountStore store, string? chatApiHost = null)
+    public MultiAccountManager(TraeAccountStore store, TraeUpstreamOptions? upstream = null)
     {
         _store = store;
-        _chatApiHost = chatApiHost;
+        _upstream = upstream;
         Settings = store.LoadOrMigrate();
         foreach (var account in Settings.Accounts)
-            _accounts[account.Id] = new TraeAccountRuntime(account, _chatApiHost);
+            _accounts[account.Id] = new TraeAccountRuntime(account, _upstream);
     }
 
     public MultiAccountSettings Settings { get; private set; }
@@ -174,7 +186,7 @@ public sealed class MultiAccountManager
                 throw new InvalidOperationException($"账号别名 '{account.Alias}' 已存在。");
 
             if (string.IsNullOrWhiteSpace(account.Id)) account.Id = Guid.NewGuid().ToString("N");
-            _accounts[account.Id] = new TraeAccountRuntime(account, _chatApiHost);
+            _accounts[account.Id] = new TraeAccountRuntime(account, _upstream);
             Settings.Accounts = _accounts.Values.Select(x => x.Account).OrderBy(x => x.Alias).ToList();
             _store.Save(Settings);
             return account;
@@ -268,7 +280,7 @@ public sealed class MultiAccountManager
         foreach (var account in settings.Accounts)
             if (string.IsNullOrWhiteSpace(account.Id)) account.Id = Guid.NewGuid().ToString("N");
         settings.Accounts = settings.Accounts.OrderBy(x => x.Alias).ToList();
-        var runtimes = settings.Accounts.Select(account => new TraeAccountRuntime(account, _chatApiHost)).ToList();
+        var runtimes = settings.Accounts.Select(account => new TraeAccountRuntime(account, _upstream)).ToList();
 
         lock (_selectionGate)
         {
