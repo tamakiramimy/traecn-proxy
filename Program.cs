@@ -142,34 +142,44 @@ if (testMode)
     Console.WriteLine($"--- 自测:向 {testModel} 发送消息 ---");
     var sb = new StringBuilder();
     using var lease = accountManager.AcquireByAlias(accountAlias);
-    await foreach (var ev in lease.Client.ChatStreamAsync(new[] { ("user", "请只回复四个字:验证成功") }, testModel))
+    try
     {
-        if (ev.Event == "metadata")
+        var testDescriptor = await lease.Client.ResolveModelAsync(testModel);
+        await foreach (var ev in lease.Client.ChatStreamAsync(new[] { ("user", "请只回复四个字:验证成功") }, testDescriptor))
         {
-            Console.WriteLine($"[metadata] {ev.Data}");
+            if (ev.Event == "metadata")
+            {
+                Console.WriteLine($"[metadata] {ev.Data}");
+            }
+            else if (ev.Event == "output")
+            {
+                var j = JsonNode.Parse(ev.Data) as JsonObject;
+                string? resp = (string?)j?["response"];
+                if (!string.IsNullOrEmpty(resp)) { sb.Append(resp); Console.Write(resp); }
+            }
+            else if (ev.Event == "token_usage")
+            {
+                var j = JsonNode.Parse(ev.Data) as JsonObject;
+                Console.WriteLine($"\n[usage] prompt={j?["prompt_tokens"]} completion={j?["completion_tokens"]} total={j?["total_tokens"]}");
+            }
+            else if (ev.Event == "error")
+            {
+                var payload = JsonNode.Parse(ev.Data) as JsonObject;
+                Console.WriteLine($"[error] code={payload?["code"]}");
+            }
+            else
+            {
+                var payload = JsonNode.Parse(ev.Data) as JsonObject;
+                string keys = payload is null ? "non-json" : string.Join(',', payload.Select(entry => entry.Key));
+                Console.WriteLine($"[{ev.Event}] fields={keys}");
+            }
         }
-        else if (ev.Event == "output")
-        {
-            var j = JsonNode.Parse(ev.Data) as JsonObject;
-            string? resp = (string?)j?["response"];
-            if (!string.IsNullOrEmpty(resp)) { sb.Append(resp); Console.Write(resp); }
-        }
-        else if (ev.Event == "token_usage")
-        {
-            var j = JsonNode.Parse(ev.Data) as JsonObject;
-            Console.WriteLine($"\n[usage] prompt={j?["prompt_tokens"]} completion={j?["completion_tokens"]} total={j?["total_tokens"]}");
-        }
-        else if (ev.Event == "error")
-        {
-            var payload = JsonNode.Parse(ev.Data) as JsonObject;
-            Console.WriteLine($"[error] code={payload?["code"]}");
-        }
-        else
-        {
-            var payload = JsonNode.Parse(ev.Data) as JsonObject;
-            string keys = payload is null ? "non-json" : string.Join(',', payload.Select(entry => entry.Key));
-            Console.WriteLine($"[{ev.Event}] fields={keys}");
-        }
+    }
+    catch (Exception ex) when (ex is TraeModelSelectionException or TraeModelNotFoundException or TraeModelCatalogException)
+    {
+        Console.WriteLine();
+        Console.WriteLine($"自测失败:{ex.Message} ✘");
+        return 1;
     }
     Console.WriteLine();
     Console.WriteLine(sb.Length > 0 ? "自测通过 ✔" : "自测失败:未收到回复 ✘");
@@ -297,7 +307,6 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx) =>
     TraeModelDescriptor descriptor;
     try { descriptor = await lease.Client.ResolveModelAsync(model, ct); }
     catch (TraeModelNotFoundException) { return UnsupportedModel(model); }
-    if (!lease.Client.UsesExternalChatApiHost && ideBridge is null) return IdeBridgeDisabled();
     var upstream = ChatUpstream(lease, messages, descriptor, ct);
     if (stream)
     {
@@ -323,7 +332,6 @@ app.MapPost("/v1/responses", async (HttpContext ctx) =>
     TraeModelDescriptor descriptor;
     try { descriptor = await lease.Client.ResolveModelAsync(model, ct); }
     catch (TraeModelNotFoundException) { return UnsupportedModel(model); }
-    if (!lease.Client.UsesExternalChatApiHost && ideBridge is null) return IdeBridgeDisabled();
     var upstream = ChatUpstream(lease, messages, descriptor, ct);
     string respId = $"resp_{Guid.NewGuid():N}";
     if (stream)
@@ -349,7 +357,6 @@ app.MapPost("/v1/messages", async (HttpContext ctx) =>
     TraeModelDescriptor descriptor;
     try { descriptor = await lease.Client.ResolveModelAsync(model, ct); }
     catch (TraeModelNotFoundException) { return UnsupportedModel(model); }
-    if (!lease.Client.UsesExternalChatApiHost && ideBridge is null) return IdeBridgeDisabled();
     var upstream = ChatUpstream(lease, messages, descriptor, ct);
     if (stream)
     {
@@ -550,11 +557,10 @@ string ContentOf(JsonNode? content) => content switch
 };
 
 // 配置了独立 chat 服务面时直连，否则回落到需要 IDE 在线的 bridge。
+// 企业面与独立 chat 面均已可直连，IDE Bridge 不再参与对话。
 IAsyncEnumerable<TraeSseEvent> ChatUpstream(
     AccountLease lease, List<(string role, string text)> messages, TraeModelDescriptor descriptor, CancellationToken ct) =>
-    lease.Client.UsesExternalChatApiHost
-        ? lease.Client.ChatStreamAsync(messages, descriptor.ConfigName, ct)
-        : ideBridge!.ChatStreamAsync(messages, descriptor, ct);
+    lease.Client.ChatStreamAsync(messages, descriptor, ct);
 
 IResult UnsupportedModel(string model) => Results.BadRequest(new
 {
@@ -565,16 +571,6 @@ IResult UnsupportedModel(string model) => Results.BadRequest(new
         code = "model_not_supported"
     }
 });
-
-IResult IdeBridgeDisabled() => Results.Json(new
-{
-    error = new
-    {
-        message = "TRAE IDE bridge is disabled; enable IdeBridge in appsettings.json to use selectable Agent models.",
-        type = "configuration_error",
-        code = "ide_bridge_disabled"
-    }
-}, statusCode: 503);
 
 async Task<JsonObject> CollectOpenAI(IAsyncEnumerable<TraeSseEvent> upstream, string model, CancellationToken ct)
 {
@@ -716,7 +712,6 @@ async Task<JsonObject> CollectAnthropic(IAsyncEnumerable<TraeSseEvent> upstream,
         if (ev.Event == "output" && j != null)
         {
             text.Append((string?)j["response"] ?? "");
-            text.Append((string?)j["reasoning_content"] ?? "");
         }
         else if (ev.Event == "token_usage" && j != null)
         {

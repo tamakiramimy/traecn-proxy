@@ -24,8 +24,9 @@ public class TraeClient
     private const string SoloIdeVersion = "0.1.43";
     private const string SoloIdeVersionCode = "20260716";
     private const string SoloChatFunction = "solo_work_lite";
-    // The current enterprise chat endpoint always selects this tenant default model.
-    public const string DefaultChatModel = "Doubao-Seed-Evolving";
+    private const string EnterpriseChatFunction = "chat_v3";
+    // 请求未指定模型时的保守默认值，必须是目录中的精确 ID。
+    public const string DefaultChatModel = "Doubao-Seed-Evolving__dev";
 
     private readonly HttpClient _http;
     private readonly string _apiHost;
@@ -208,7 +209,19 @@ public class TraeClient
     public IAsyncEnumerable<TraeSseEvent> ChatStreamAsync(
         IEnumerable<(string role, string text)> messages, string model, CancellationToken ct = default)
     {
-        return ChatStreamCore(messages, model, ct);
+        return ChatStreamCore(messages, model, model, ct);
+    }
+
+    /// <summary>Streams a chat completion for an exact catalog model.</summary>
+    /// <param name="messages">The ordered conversation turns.</param>
+    /// <param name="model">The resolved catalog model.</param>
+    /// <param name="ct">Cancels streaming.</param>
+    /// <returns>The upstream SSE events.</returns>
+    public IAsyncEnumerable<TraeSseEvent> ChatStreamAsync(
+        IEnumerable<(string role, string text)> messages, TraeModelDescriptor model, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(model);
+        return ChatStreamCore(messages, model.Id, model.ConfigName, ct);
     }
 
     /// <summary>Lists the model config names selectable on the configured chat service.</summary>
@@ -238,7 +251,7 @@ public class TraeClient
     }
 
     private async IAsyncEnumerable<TraeSseEvent> ChatStreamCore(
-        IEnumerable<(string role, string text)> messages, string model, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
+        IEnumerable<(string role, string text)> messages, string model, string configName, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
         var msgList = new JsonArray();
         foreach (var (role, text) in messages)
@@ -253,13 +266,12 @@ public class TraeClient
         {
             ["messages"] = msgList,
             ["model"] = model,
-            ["function"] = _usesExternalChatApiHost ? SoloChatFunction : "inline_chat",
+            ["config_name"] = configName,
+            ["function"] = _usesExternalChatApiHost ? SoloChatFunction : EnterpriseChatFunction,
             ["stream"] = true,
             ["request_id"] = sessionId,
             ["session_id"] = sessionId
         };
-        if (_usesExternalChatApiHost)
-            body["config_name"] = model;
 
         var req = new HttpRequestMessage(HttpMethod.Post, $"{_chatApiHost}/api/agent/v3/llm_utils_chat");
         AddHeaders(req, _usesExternalChatApiHost);
@@ -308,9 +320,27 @@ public class TraeClient
     private static bool MatchesRequestedModel(string requestedModel, string actualModel)
     {
         if (string.Equals(requestedModel, actualModel, StringComparison.OrdinalIgnoreCase)) return true;
-        const string maxVariant = "__max";
-        return requestedModel.EndsWith(maxVariant, StringComparison.OrdinalIgnoreCase) &&
-               string.Equals(requestedModel[..^maxVariant.Length], actualModel, StringComparison.OrdinalIgnoreCase);
+
+        string requested = Normalize(StripVariant(requestedModel));
+        string actual = Normalize(actualModel);
+        if (requested.Length == 0 || actual.Length == 0) return false;
+        // 上游回显的是服务商内部模型名（如 ali-deepseek-v4-pro-0813），但必须包含所选模型，否则视为降级。
+        if (actual.Contains(requested, StringComparison.Ordinal)) return true;
+
+        const string officialSuffix = "official";
+        return requested.EndsWith(officialSuffix, StringComparison.Ordinal) &&
+               actual.Contains(requested[..^officialSuffix.Length], StringComparison.Ordinal);
+    }
+
+    private static string Normalize(string modelId) =>
+        new(modelId.Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
+
+    private static string StripVariant(string modelId)
+    {
+        foreach (string suffix in (string[])["__max", "__dev"])
+            if (modelId.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                return modelId[..^suffix.Length];
+        return modelId;
     }
 
     /// <summary>用 refreshToken 换新 token(与 IDE SaaS 版 oauthService 一致:POST /cloudide/api/v3/trae/oauth/ExchangeToken)。</summary>

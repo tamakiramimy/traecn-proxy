@@ -109,6 +109,85 @@ public sealed class TraeAgentClientTests
         events.Select(streamEvent => streamEvent.Event).Should().Equal("metadata", "output");
     }
 
+    [TestMethod]
+    public async Task ChatStreamAsync_UsesEnterpriseChatChannelWithConfigName()
+    {
+        var handler = new RecordingHandler("event: metadata\ndata: {\"model\":\"glm-5.3\"}\n\nevent: output\ndata: {\"response\":\"ok\"}\n\n");
+        var client = new TraeClient(
+            new TraeAuthData { Token = "test-token", ApiHost = "https://console.example" },
+            httpMessageHandler: handler);
+
+        var events = new List<TraeSseEvent>();
+        await foreach (var streamEvent in client.ChatStreamAsync(
+            new[] { ("user", "ping") },
+            new TraeModelDescriptor("glm-5.3__dev", "glm-5.3", "GLM-5.3", TraeModelVariant.Dev)))
+            events.Add(streamEvent);
+
+        handler.Host.Should().Be("console.example");
+        using var body = JsonDocument.Parse(handler.Body!);
+        body.RootElement.GetProperty("function").GetString().Should().Be("chat_v3");
+        body.RootElement.GetProperty("model").GetString().Should().Be("glm-5.3__dev");
+        body.RootElement.GetProperty("config_name").GetString().Should().Be("glm-5.3");
+        events.Select(streamEvent => streamEvent.Event).Should().Equal("metadata", "output");
+    }
+
+    [TestMethod]
+    public async Task ChatStreamAsync_AcceptsProviderInternalModelName()
+    {
+        var handler = new RecordingHandler("event: metadata\ndata: {\"model\":\"ali-deepseek-v4-pro-0813\"}\n\nevent: output\ndata: {\"response\":\"ok\"}\n\n");
+        var client = new TraeClient(
+            new TraeAuthData { Token = "test-token", ApiHost = "https://console.example" },
+            httpMessageHandler: handler);
+
+        var events = new List<TraeSseEvent>();
+        await foreach (var streamEvent in client.ChatStreamAsync(
+            new[] { ("user", "ping") },
+            new TraeModelDescriptor("DeepSeek-V4-Pro-Official__dev", "DeepSeek-V4-Pro-Official", "DeepSeek-V4-Pro 正式版", TraeModelVariant.Dev)))
+            events.Add(streamEvent);
+
+        events.Select(streamEvent => streamEvent.Event).Should().Equal("metadata", "output");
+    }
+
+    [TestMethod]
+    public async Task ChatStreamAsync_RejectsSilentModelDowngrade()
+    {
+        var handler = new RecordingHandler("event: metadata\ndata: {\"model\":\"Doubao-Seed-Evolving\"}\n\nevent: output\ndata: {\"response\":\"ok\"}\n\n");
+        var client = new TraeClient(
+            new TraeAuthData { Token = "test-token", ApiHost = "https://console.example" },
+            httpMessageHandler: handler);
+
+        Func<Task> stream = async () =>
+        {
+            await foreach (var _ in client.ChatStreamAsync(
+                new[] { ("user", "ping") },
+                new TraeModelDescriptor("glm-5.3__dev", "glm-5.3", "GLM-5.3", TraeModelVariant.Dev)))
+            {
+            }
+        };
+
+        await stream.Should().ThrowAsync<TraeModelSelectionException>();
+    }
+
+    [TestMethod]
+    public async Task ChatStreamAsync_RejectsQuietVersionDowngrade()
+    {
+        var handler = new RecordingHandler("event: metadata\ndata: {\"model\":\"glm-5\"}\n\nevent: output\ndata: {\"response\":\"ok\"}\n\n");
+        var client = new TraeClient(
+            new TraeAuthData { Token = "test-token", ApiHost = "https://console.example" },
+            httpMessageHandler: handler);
+
+        Func<Task> stream = async () =>
+        {
+            await foreach (var _ in client.ChatStreamAsync(
+                new[] { ("user", "ping") },
+                new TraeModelDescriptor("glm-5.3__dev", "glm-5.3", "GLM-5.3", TraeModelVariant.Dev)))
+            {
+            }
+        };
+
+        await stream.Should().ThrowAsync<TraeModelSelectionException>();
+    }
+
     private sealed class RecordingHandler(string responseBody) : HttpMessageHandler
     {
         public string? Host { get; private set; }
