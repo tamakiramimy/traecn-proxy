@@ -107,7 +107,12 @@ if (forceLogin)
     Console.WriteLine($"已从 IDE 导入账号: {accountAlias}");
 }
 
-if (webLogin || accountManager.Accounts.Count == 0)
+// CLI 授权回调只能落到本机 127.0.0.1，容器等无头部署改由管理端完成登录。
+bool deferLoginToAdmin = accountManager.Accounts.Count == 0
+    && !webLogin && !testMode && !listChatModels
+    && !string.IsNullOrEmpty(adminKey);
+
+if (webLogin || (accountManager.Accounts.Count == 0 && !deferLoginToAdmin))
 {
     var (deviceId, machineId) = TraeAuthStore.ReadDeviceIds();
     var bootstrapClient = new TraeClient(new TraeAuthData(), deviceId, machineId);
@@ -131,6 +136,8 @@ if (listAccounts)
 }
 
 Console.WriteLine($"账号池就绪: {accountManager.Accounts.Count} 个账号");
+if (deferLoginToAdmin)
+    Console.WriteLine("尚未配置账号，请打开 /admin 完成 Trae 网页登录后再调用 /v1 接口。");
 
 if (listChatModels)
 {
@@ -427,6 +434,58 @@ app.MapPost("/admin/api/accounts/{alias}/test", async (string alias, Cancellatio
         return await lease.Client.ValidateTokenAsync(ct) ? Results.Ok(new { ok = true }) : Results.BadRequest(new { error = "token validation failed" });
     }
     catch (Exception ex) { return Results.NotFound(new { error = ex.Message }); }
+});
+app.MapGet("/admin/api/accounts/{alias}/models", async (string alias, CancellationToken ct) =>
+{
+    try
+    {
+        using var lease = accountManager.AcquireByAlias(alias);
+        var catalog = await lease.Client.GetModelCatalogAsync(ct: ct);
+        return Results.Json(new
+        {
+            models = catalog.Models.Select(model => new
+            {
+                id = model.Id,
+                display_name = model.DisplayName,
+                config_name = model.ConfigName,
+                variant = model.Variant.ToString().ToLowerInvariant()
+            })
+        });
+    }
+    catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+});
+app.MapPost("/admin/api/accounts/{alias}/models/test", async (string alias, HttpContext ctx) =>
+{
+    var ct = ctx.RequestAborted;
+    var body = JsonNode.Parse(await new StreamReader(ctx.Request.Body).ReadToEndAsync(ct))?.AsObject();
+    string requested = (string?)body?["model"] ?? "";
+    if (string.IsNullOrWhiteSpace(requested))
+        return Results.BadRequest(new { error = "model is required" });
+
+    try
+    {
+        using var lease = accountManager.AcquireByAlias(alias);
+        var descriptor = await lease.Client.ResolveModelAsync(requested, ct);
+        string prompt = $"请回复{descriptor.ConfigName}";
+        var reply = new StringBuilder();
+        string? actualModel = null;
+        await foreach (var ev in lease.Client.ChatStreamAsync([("user", prompt)], descriptor, ct))
+        {
+            var payload = JsonNode.Parse(ev.Data) as JsonObject;
+            if (ev.Event == "metadata") actualModel = (string?)payload?["model"];
+            else if (ev.Event == "output") reply.Append((string?)payload?["response"] ?? "");
+        }
+        return Results.Json(new
+        {
+            ok = true,
+            model = descriptor.Id,
+            actual_model = actualModel,
+            prompt,
+            reply = reply.ToString().Trim()
+        });
+    }
+    catch (TraeModelNotFoundException ex) { return Results.BadRequest(new { error = ex.Message }); }
+    catch (Exception ex) { return Results.Json(new { error = ex.Message }, statusCode: 502); }
 });
 app.MapPut("/admin/api/settings", async (HttpContext ctx) =>
 {

@@ -44,7 +44,7 @@ dotnet run
 
 ## Docker
 
-多架构镜像（`linux/amd64`、`linux/arm64`）已发布到 Docker Hub，自下一个 Release 起同时发布到 GitHub Container Registry：
+多架构镜像（`linux/amd64`、`linux/arm64`）已发布到 Docker Hub 与 GitHub Container Registry：
 
 ```bash
 docker pull tamakiramimy/traecn-proxy:latest
@@ -54,22 +54,26 @@ docker pull ghcr.io/tamakiramimy/traecn-proxy:latest
 
 ```bash
 docker run -d --name trancn-proxy \
-  -p 9220:9220 \
+  -p 127.0.0.1:9220:9220 \
   -v trancn-data:/data \
   -e TRANCN_API_KEY=请替换为你的网关密钥 \
   -e TRANCN_ADMIN_KEY=请替换为你的管理密钥 \
-  tamakiramimy/traecn-proxy:0.3.1
+  tamakiramimy/traecn-proxy:0.4.1
 ```
 
-镜像内的 `appsettings.json` 已将 `Server.Listen` 设为 `0.0.0.0`、`Accounts.DataDirectory` 设为 `/data`，并关闭 IdeBridge（容器内没有 Trae IDE，仅走 Standalone 模式）。首次启动会在日志中打印网页授权地址，复制到浏览器完成登录后，凭据保存在 `/data` 卷中。请务必通过环境变量覆盖默认密钥，不要在未鉴权的情况下把端口暴露到公网。
+镜像内的 `appsettings.json` 已将 `Server.Listen` 设为 `0.0.0.0`、`Accounts.DataDirectory` 设为 `/data`，并关闭 IdeBridge（容器内没有 Trae CN IDE）。请务必通过环境变量覆盖默认密钥，不要在未鉴权的情况下把端口暴露到公网。
+
+容器里不走 CLI 授权（回调会落到容器内的 `127.0.0.1`，宿主浏览器不可达）。启动后直接打开 <http://127.0.0.1:9220/admin> ，用 `TRANCN_ADMIN_KEY` 连接，在「添加网页登录账号」里完成 Trae CN 授权；重复该步骤可添加多个账号。
+
+已在容器内实测可用（企业账号、`chat_v3` 通道）：模型目录、精确选模、OpenAI / Anthropic 端点、流式输出。依赖 IDE Agent bridge 的能力在容器内不可用。
 
 自行构建镜像（基于 Release 中的自包含产物）：
 
 ```powershell
-pwsh scripts/prepare-docker-artifacts.ps1 -Version v0.3.1
+pwsh scripts/prepare-docker-artifacts.ps1 -Version v0.4.1
 docker buildx build --platform linux/amd64,linux/arm64 `
-  --build-arg VERSION=0.3.1 `
-  -t <账号>/traecn-proxy:0.3.1 --push .
+  --build-arg VERSION=0.4.1 `
+  -t <账号>/traecn-proxy:0.4.1 --push .
 ```
 
 ## 配置
@@ -165,7 +169,7 @@ bridge 会记录活动请求关联的 Aha `request_stream` 出入站 envelope。
 
 账号库位于 `accounts.json`，首次运行会自动迁移旧的 `auth.json` 为 `default` 账号。JSON 可通过 `--account-import` 或管理端导入。多账号推荐使用独立网页授权，避免与 IDE 登录态竞争 refresh token。
 
-设置 `TRANCN_ADMIN_KEY` 后访问 `http://127.0.0.1:9220/admin`。管理端支持账号列表、JSON 导入、启停、刷新、测试、删除和 Trae 网页登录。远程部署网页登录时必须配置浏览器可访问的 `--public-base-url https://proxy.example.com`。
+设置 `TRANCN_ADMIN_KEY` 后访问 `http://127.0.0.1:9220/admin`。管理端支持账号列表、JSON 导入、启停、刷新、Token 校验、逐模型测试对话、删除和 Trae 网页登录。模型测试会向所选模型发送一句「请回复&lt;模型名&gt;」并回显上游实际模型，用于确认该账号在该模型上可用。远程部署网页登录时必须配置浏览器可访问的 `--public-base-url https://proxy.example.com`。
 
 sub2api 只需配置一个 OpenAI 兼容上游：
 

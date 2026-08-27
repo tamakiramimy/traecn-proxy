@@ -11,6 +11,7 @@ createApp({
     const busy = ref(new Set());
     const notice = ref(null);
     const showKey = ref(false);
+    const modelTest = ref({ open: false, alias: '', models: [], selected: '', result: null });
     let noticeTimer;
 
     const enabledCount = computed(() => accounts.value.filter(account => account.enabled).length);
@@ -105,6 +106,27 @@ createApp({
     };
     const setPriority = account => runAction(`priority:${account.alias}`, () =>
       api(`/admin/api/accounts/${encodeURIComponent(account.alias)}/priority/${account.priority}`, { method: 'POST' }), `${account.alias} 优先级已更新`);
+
+    const configNameOf = modelId =>
+      modelTest.value.models.find(model => model.id === modelId)?.config_name || modelId;
+    const closeModelTest = () => { modelTest.value = { open: false, alias: '', models: [], selected: '', result: null }; };
+    const openModelTest = account => runAction(`models:${account.alias}`, async () => {
+      const data = await api(`/admin/api/accounts/${encodeURIComponent(account.alias)}/models`);
+      const models = data.models || [];
+      modelTest.value = { open: true, alias: account.alias, models, selected: models[0]?.id || '', result: null };
+    });
+    const runModelTest = () => runAction('model-test', async () => {
+      const { alias, selected } = modelTest.value;
+      try {
+        const data = await api(`/admin/api/accounts/${encodeURIComponent(alias)}/models/test`, {
+          method: 'POST',
+          body: JSON.stringify({ model: selected })
+        });
+        modelTest.value = { ...modelTest.value, result: { ...data, ok: true } };
+      } catch (error) {
+        modelTest.value = { ...modelTest.value, result: { ok: false, error: error.message } };
+      }
+    });
     const saveSettings = () => runAction('settings', () =>
       api('/admin/api/settings', { method: 'PUT', body: JSON.stringify(settings.value) }), '调度设置已保存');
     const importAccounts = () => {
@@ -159,10 +181,11 @@ createApp({
     if (adminKey.value) loadAccounts('connect');
 
     return {
-      adminKey, accounts, settings, importJson, loginAlias, connected, notice, showKey,
+      adminKey, accounts, settings, importJson, loginAlias, connected, notice, showKey, modelTest,
       enabledCount, disabledCount, strategyLabel, isBusy, connect, loadAccounts, toggleAccount,
       refreshAccount, testAccount, removeAccount, setPriority, saveSettings, importAccounts,
-      startLogin, formatDate, relativeExpiry, tokenState, initials
+      startLogin, formatDate, relativeExpiry, tokenState, initials,
+      openModelTest, closeModelTest, runModelTest, configNameOf
     };
   }
 }).mount('#app');

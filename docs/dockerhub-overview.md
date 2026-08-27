@@ -17,7 +17,7 @@
 
 架构：`linux/amd64`、`linux/arm64`。
 
-自下一个 Release 起，镜像会同时发布到 GitHub Container Registry，Docker Hub 拉不动时可以换源：
+镜像同时发布到 GitHub Container Registry，Docker Hub 拉不动时可以换源：
 
 ```bash
 docker pull ghcr.io/tamakiramimy/traecn-proxy:latest
@@ -25,10 +25,14 @@ docker pull ghcr.io/tamakiramimy/traecn-proxy:latest
 
 如果 `docker pull` 报 `EOF` 或 TLS 超时，通常是本机 Docker 守护进程没有走代理（浏览器能打开 Docker Hub 不代表 daemon 能出网）。在 Docker Desktop 的 Settings → Resources → Proxies 里手动填入代理地址后重启即可。
 
-## 重要限制（请先阅读）
+## 能力与限制（请先阅读）
 
-- 精确选模依赖运行中的 Trae CN IDE Agent bridge（IDE 需以 `--remote-debugging-port=9333` 启动）。**容器内没有 IDE，镜像默认关闭 IdeBridge**，只能走 standalone HTTP 路径。
-- standalone 路径（`llm_utils_chat`）已验证会忽略请求中的模型 ID 并回退到上游默认模型，因此容器部署目前**不适合需要精确选模的场景**。
+已在容器内实测可用（企业账号，`chat_v3` 通道直连上游）：模型目录、**精确选模**、OpenAI / Anthropic 端点、流式输出、多账号管理。上游实际模型与所选不符时会直接报错，不会静默降级。
+
+限制：
+
+- 容器内没有 Trae CN IDE，镜像默认关闭 `IdeBridge`，**依赖 IDE Agent bridge 的能力不可用**（该协议仍在取证阶段）。
+- SOLO / 消费版服务面（`solo_work_lite`）按 `config_name` 选模，与企业面的 `__dev` / `__max` ID 不通用；该面在容器内尚未做完整回归。
 - 仅验证了基础文本对话；工具调用、多模态、完整 Anthropic 交错消息规则尚未实现。
 - 本项目与 Trae、字节跳动无隶属关系。使用前请确认符合组织 IT 政策、账号授权范围与服务条款。
 
@@ -43,18 +47,14 @@ docker run -d --name trancn-proxy \
   tamakiramimy/traecn-proxy:latest
 ```
 
-首次启动会在日志中打印网页授权地址：
+首次启动后容器里还没有账号，打开管理台 <http://127.0.0.1:9220/admin> ，填入 `TRANCN_ADMIN_KEY` 连接后，在「添加网页登录账号」填一个别名并完成 Trae CN 授权。重复该步骤可添加多个账号，凭据保存在 `/data` 卷中，重启不丢。
 
-```bash
-docker logs -f trancn-proxy
-```
-
-把地址复制到浏览器完成 Trae CN 登录，凭据会保存在 `/data` 卷中，后续重启无需再次授权。
+管理台还支持按账号启停、优先级、Token 刷新与校验、**逐个模型发一句测试对话**（会回显上游实际模型）、JSON 批量导入。
 
 验证服务：
 
 ```bash
-curl -H "Authorization: Bearer $TRANCN_API_KEY" http://127.0.0.1:9220/v1/status
+curl -H "Authorization: Bearer $TRANCN_API_KEY" http://127.0.0.1:9220/v1/models
 ```
 
 ## 镜像内的默认配置

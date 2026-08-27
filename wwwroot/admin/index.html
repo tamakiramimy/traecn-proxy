@@ -126,6 +126,9 @@
                 <span>{{ account.last_error || '无错误记录' }}</span>
               </div>
               <div class="actions" data-label="操作">
+                <button class="icon-button" @click="openModelTest(account)" :disabled="isBusy(`models:${account.alias}`)" title="测试模型" :aria-label="`测试 ${account.alias} 的模型`">
+                  <span class="spinner dark" v-if="isBusy(`models:${account.alias}`)"></span><svg v-else viewBox="0 0 24 24"><path d="M5 5h14M5 12h9M5 19h5"/><circle cx="18" cy="17" r="3.2"/><path d="m20.4 19.4 1.6 1.6"/></svg>
+                </button>
                 <button class="icon-button" @click="testAccount(account)" :disabled="isBusy(`test:${account.alias}`)" title="测试 Token" :aria-label="`测试 ${account.alias} Token`">
                   <span class="spinner dark" v-if="isBusy(`test:${account.alias}`)"></span><svg v-else viewBox="0 0 24 24"><path d="M9 3h6M10 9l-4.5 8a2 2 0 0 0 1.7 3h9.6a2 2 0 0 0 1.7-3L14 9V3h-4v6Z"/><path d="M8 15h8"/></svg>
                 </button>
@@ -194,6 +197,48 @@
           </div>
         </section>
       </template>
+    </div>
+
+    <div class="modal-backdrop" v-if="modelTest.open" @click.self="closeModelTest">
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="model-test-title">
+        <div class="modal-heading">
+          <div>
+            <span class="step-label">MODEL CHECK</span>
+            <h2 id="model-test-title">模型测试 · {{ modelTest.alias }}</h2>
+            <p>选择模型后发送一句“请回复&lt;模型名&gt;”，用于确认该账号在该模型上可用且未被静默降级。</p>
+          </div>
+          <button class="icon-button" @click="closeModelTest" aria-label="关闭模型测试">
+            <svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg>
+          </button>
+        </div>
+
+        <label class="stack-form" for="model-select">
+          可用模型（{{ modelTest.models.length }}）
+          <select id="model-select" v-model="modelTest.selected" :disabled="modelTest.models.length === 0">
+            <option v-for="model in modelTest.models" :key="model.id" :value="model.id">
+              {{ model.display_name }} · {{ model.id }}
+            </option>
+          </select>
+        </label>
+        <p class="helper" v-if="modelTest.selected">提示词：请回复{{ configNameOf(modelTest.selected) }}</p>
+
+        <div class="modal-result" v-if="modelTest.result" :class="modelTest.result.ok ? 'success' : 'error'">
+          <template v-if="modelTest.result.ok">
+            <p><strong>实际模型</strong><span>{{ modelTest.result.actual_model || '未回传' }}</span></p>
+            <p><strong>回复</strong><span>{{ modelTest.result.reply || '(空)' }}</span></p>
+          </template>
+          <p v-else><strong>失败</strong><span>{{ modelTest.result.error }}</span></p>
+        </div>
+
+        <div class="modal-footer">
+          <button class="button secondary" @click="closeModelTest">关闭</button>
+          <button class="button primary" @click="runModelTest" :disabled="!modelTest.selected || isBusy('model-test')">
+            <span class="spinner" v-if="isBusy('model-test')"></span>
+            <svg v-else viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+            {{ isBusy('model-test') ? '正在测试…' : '发送测试' }}
+          </button>
+        </div>
+      </section>
     </div>
 
     <div class="toast" v-if="notice" :class="notice.type" role="status" aria-live="polite">

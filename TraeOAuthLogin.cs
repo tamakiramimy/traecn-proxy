@@ -17,7 +17,9 @@ public sealed class TraeOAuthLoginManager
         string state = ToUrlSafe(RandomNumberGenerator.GetBytes(32));
         string verifier = ToUrlSafe(RandomNumberGenerator.GetBytes(48));
         string challenge = ToUrlSafe(SHA256.HashData(Encoding.ASCII.GetBytes(verifier)));
-        _pending[state] = new PendingLogin(alias, verifier, deviceId, machineId, DateTimeOffset.UtcNow.AddMinutes(5));
+        // 上游回调不会回传 state，只原样回传 login_trace_id，因此用它停放待处理登录。
+        string loginTraceId = Guid.NewGuid().ToString();
+        _pending[loginTraceId] = new PendingLogin(alias, verifier, deviceId, machineId, DateTimeOffset.UtcNow.AddMinutes(5));
         RemoveExpired();
 
         var query = new Dictionary<string, string>
@@ -29,7 +31,7 @@ public sealed class TraeOAuthLoginManager
             ["auth_type"] = "local",
             ["client_id"] = TraeClient.DefaultClientId,
             ["redirect"] = "0",
-            ["login_trace_id"] = Guid.NewGuid().ToString(),
+            ["login_trace_id"] = loginTraceId,
             ["auth_callback_url"] = callbackUrl,
             ["state"] = state,
             ["machine_id"] = machineId,
@@ -49,8 +51,7 @@ public sealed class TraeOAuthLoginManager
 
     public async Task<TraeAccount> CompleteAsync(IQueryCollection query, CancellationToken ct)
     {
-        string state = query["state"].ToString();
-        if (string.IsNullOrWhiteSpace(state) || !_pending.TryRemove(state, out var pending) || pending.ExpiresAt <= DateTimeOffset.UtcNow)
+        if (!TryTakePending(query, out var pending))
             throw new InvalidOperationException("网页登录状态无效或已过期，请重新发起登录。");
 
         string refreshToken = query["refreshToken"].ToString();
@@ -93,6 +94,22 @@ public sealed class TraeOAuthLoginManager
             _pending.TryRemove(item.Key, out _);
     }
 
+    /// <summary>Consumes the pending login matching the callback's trace identifier.</summary>
+    /// <param name="query">The OAuth callback query.</param>
+    /// <param name="pending">The matching pending login when found.</param>
+    /// <returns><see langword="true"/> when an unexpired pending login was consumed.</returns>
+    internal bool TryTakePending(IQueryCollection query, out PendingLogin pending)
+    {
+        pending = default!;
+        string key = new[] { "loginTraceID", "login_trace_id", "state" }
+            .Select(name => query[name].ToString())
+            .FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? "";
+        if (string.IsNullOrWhiteSpace(key) || !_pending.TryRemove(key, out var found)) return false;
+        if (found.ExpiresAt <= DateTimeOffset.UtcNow) return false;
+        pending = found;
+        return true;
+    }
+
     private static string ToUrlSafe(byte[] value) => Convert.ToBase64String(value).TrimEnd('=').Replace('+', '-').Replace('/', '_');
 
     private static DateTimeOffset? ParseDate(string? value, long? durationMs)
@@ -106,5 +123,5 @@ public sealed class TraeOAuthLoginManager
         return long.TryParse(value, out var milliseconds) && milliseconds > 0 ? DateTimeOffset.FromUnixTimeMilliseconds(milliseconds) : null;
     }
 
-    private sealed record PendingLogin(string Alias, string Verifier, string DeviceId, string MachineId, DateTimeOffset ExpiresAt);
+    internal sealed record PendingLogin(string Alias, string Verifier, string DeviceId, string MachineId, DateTimeOffset ExpiresAt);
 }
