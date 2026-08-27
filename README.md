@@ -6,7 +6,10 @@
 
 ## 已知限制
 
-- 当前上游 `llm_utils_chat` 端点会忽略请求的 `model`，回落为租户默认模型。当前代理只公开已实测可用的默认模型 `Doubao-Seed-Evolving`；请求其他模型会返回明确的 `model_not_supported` 错误，不会将错模型内容伪装为成功响应。
+- 可选模型通过当前运行中的 TRAE IDE Agent 调用，而不是旧的 `llm_utils_chat` HTTP 端点。TRAE 必须使用 `--remote-debugging-port=9333` 启动并保持登录。
+- 首次 Agent 请求会自动安装页面初始化 hook 并重载一次 TRAE workbench。请求通过同一个 IDE UI 串行执行，并会在 TRAE 中创建对应任务记录。
+- Agent bridge 始终使用当前 TRAE IDE 登录账号。账号池的会话粘滞和负载均衡不会切换 bridge 身份；请求模型不属于当前 IDE 账号时会明确失败。
+- 代理会校验 TRAE 返回的实际模型 metadata。实际模型与请求 ID 不一致时返回 `model_selection_mismatch`，不会静默回退到其他模型。
 - 仅验证了基础文本对话。工具调用、复杂多模态输入、完整 Anthropic 交错消息规则及思考内容分离尚未实现。
 - macOS 已实测。Windows 发布包可用，但 Trae CN 的本地数据读取尚未完成端到端验证。
 
@@ -31,8 +34,11 @@ xattr -dr com.apple.quarantine trancn-proxy
 也可从源码运行，需安装 .NET 8 SDK：
 
 ```bash
+open -a "Trae CN" --args --remote-debugging-port=9333
 dotnet run
 ```
+
+如果 TRAE 已在运行，请先完全退出后再用上述参数启动。可通过 `GET /v1/status` 的 `ide_bridge.available` 确认 bridge 是否就绪。
 
 ## 配置
 
@@ -51,6 +57,12 @@ dotnet run
 	},
 	"Accounts": {
 		"DataDirectory": ""
+	},
+	"IdeBridge": {
+		"Enabled": true,
+		"DebugEndpoint": "http://127.0.0.1:9333",
+		"RequestTimeoutSeconds": 300,
+		"PollIntervalMilliseconds": 35
 	}
 }
 ```
@@ -79,7 +91,7 @@ dotnet run
 
 ## 多账号与管理端
 
-代理对外仍只提供一个 `/v1` 入口，内部按优先级或负载选择已登录的 Trae CN 账号；同一 `X-Trancn-Session-Id`、OpenAI `user` 或 Anthropic `metadata.user_id` 会在一小时内尽量固定到同一个账号。
+代理对外仍只提供一个 `/v1` 入口，账号池用于模型目录、授权维护和旧 HTTP 路径。可选 Agent 模型的实际推理由当前 TRAE IDE 登录账号执行，同一时间只处理一个 bridge 请求。
 
 账号库位于 `accounts.json`，首次运行会自动迁移旧的 `auth.json` 为 `default` 账号。JSON 可通过 `--account-import` 或管理端导入。多账号推荐使用独立网页授权，避免与 IDE 登录态竞争 refresh token。
 
@@ -91,6 +103,12 @@ sub2api 只需配置一个 OpenAI 兼容上游：
 base_url: http://trancn-proxy:9220/v1
 api_key: <TRANCN_API_KEY>
 ```
+
+建议先请求 `/v1/models` 获取当前账号的精确 ID。2026-08-27 已实测：
+
+- `glm-5.3__dev`
+- `DeepSeek-V4-Pro-Official__dev`
+- `kimi-k2.7-code__dev`
 
 ## API
 
@@ -108,7 +126,7 @@ api_key: <TRANCN_API_KEY>
 curl http://127.0.0.1:9220/v1/chat/completions \
 	-H 'Authorization: Bearer your-gateway-key' \
 	-H 'Content-Type: application/json' \
-	-d '{"model":"Doubao-Seed-Evolving","messages":[{"role":"user","content":"你好"}]}'
+	-d '{"model":"glm-5.3__dev","messages":[{"role":"user","content":"你好"}]}'
 ```
 
 ## 安全与合规

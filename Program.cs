@@ -690,6 +690,7 @@ async Task<JsonObject> CollectAnthropic(IAsyncEnumerable<TraeSseEvent> upstream,
 async Task WriteAnthropicStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstream, string model, CancellationToken ct)
 {
     string msgId = $"msg_{Guid.NewGuid():N}";
+    bool messageStarted = false;
 
     async Task WriteEvent(string ev, JsonNode data)
     {
@@ -698,25 +699,35 @@ async Task WriteAnthropicStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstrea
         await w.FlushAsync(ct);
     }
 
-    await WriteEvent("message_start", new JsonObject
+    async Task StartMessage()
     {
-        ["type"] = "message_start",
-        ["message"] = new JsonObject
+        if (messageStarted) return;
+        messageStarted = true;
+        await WriteEvent("message_start", new JsonObject
         {
-            ["id"] = msgId, ["type"] = "message", ["role"] = "assistant",
-            ["content"] = new JsonArray(), ["model"] = model,
-            ["stop_reason"] = null, ["stop_sequence"] = null,
-            ["usage"] = new JsonObject { ["input_tokens"] = 0, ["output_tokens"] = 0 }
-        }
-    });
+            ["type"] = "message_start",
+            ["message"] = new JsonObject
+            {
+                ["id"] = msgId, ["type"] = "message", ["role"] = "assistant",
+                ["content"] = new JsonArray(), ["model"] = model,
+                ["stop_reason"] = null, ["stop_sequence"] = null,
+                ["usage"] = new JsonObject { ["input_tokens"] = 0, ["output_tokens"] = 0 }
+            }
+        });
+    }
 
     bool blockOpen = false;
     int output = 0;
     await foreach (var ev in upstream)
     {
         var j = JsonNode.Parse(ev.Data) as JsonObject;
-        if (ev.Event == "output" && j != null)
+        if (ev.Event == "metadata")
         {
+            await StartMessage();
+        }
+        else if (ev.Event == "output" && j != null)
+        {
+            await StartMessage();
             string? text = (string?)j["response"];
             if (!string.IsNullOrEmpty(text))
             {
@@ -739,6 +750,7 @@ async Task WriteAnthropicStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstrea
         }
         else if (ev.Event == "done")
         {
+            await StartMessage();
             if (blockOpen)
                 await WriteEvent("content_block_stop", new JsonObject { ["type"] = "content_block_stop", ["index"] = 0 });
             await WriteEvent("message_delta", new JsonObject
@@ -840,20 +852,26 @@ async Task WriteResponsesStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstrea
         ["model"] = model,
         ["output"] = new JsonArray()
     };
-    await WriteEvent("response.created", new JsonObject { ["type"] = "response.created", ["response"] = baseResponse.DeepClone() });
-    await WriteEvent("response.in_progress", new JsonObject { ["type"] = "response.in_progress", ["response"] = baseResponse.DeepClone() });
-    await WriteEvent("response.output_item.added", new JsonObject
+    bool responseStarted = false;
+    async Task StartResponse()
     {
-        ["type"] = "response.output_item.added",
-        ["output_index"] = 0,
-        ["item"] = new JsonObject { ["id"] = msgId, ["type"] = "message", ["status"] = "in_progress", ["role"] = "assistant", ["content"] = new JsonArray() }
-    });
-    await WriteEvent("response.content_part.added", new JsonObject
-    {
-        ["type"] = "response.content_part.added",
-        ["item_id"] = msgId, ["output_index"] = 0, ["content_index"] = 0,
-        ["part"] = new JsonObject { ["type"] = "output_text", ["text"] = "", ["annotations"] = new JsonArray() }
-    });
+        if (responseStarted) return;
+        responseStarted = true;
+        await WriteEvent("response.created", new JsonObject { ["type"] = "response.created", ["response"] = baseResponse.DeepClone() });
+        await WriteEvent("response.in_progress", new JsonObject { ["type"] = "response.in_progress", ["response"] = baseResponse.DeepClone() });
+        await WriteEvent("response.output_item.added", new JsonObject
+        {
+            ["type"] = "response.output_item.added",
+            ["output_index"] = 0,
+            ["item"] = new JsonObject { ["id"] = msgId, ["type"] = "message", ["status"] = "in_progress", ["role"] = "assistant", ["content"] = new JsonArray() }
+        });
+        await WriteEvent("response.content_part.added", new JsonObject
+        {
+            ["type"] = "response.content_part.added",
+            ["item_id"] = msgId, ["output_index"] = 0, ["content_index"] = 0,
+            ["part"] = new JsonObject { ["type"] = "output_text", ["text"] = "", ["annotations"] = new JsonArray() }
+        });
+    }
 
     var text = new StringBuilder();
     int promptTokens = 0, completionTokens = 0, totalTokens = 0;
@@ -861,8 +879,13 @@ async Task WriteResponsesStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstrea
     await foreach (var ev in upstream)
     {
         var j = JsonNode.Parse(ev.Data) as JsonObject;
-        if (ev.Event == "output" && j != null)
+        if (ev.Event == "metadata")
         {
+            await StartResponse();
+        }
+        else if (ev.Event == "output" && j != null)
+        {
+            await StartResponse();
             string? t = (string?)j["response"];
             if (!string.IsNullOrEmpty(t))
             {
@@ -884,6 +907,7 @@ async Task WriteResponsesStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstrea
         }
         else if (ev.Event == "done")
         {
+            await StartResponse();
             if (!sawContent)
             {
                 sawContent = true;

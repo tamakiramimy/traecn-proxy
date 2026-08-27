@@ -1,7 +1,7 @@
 # trancn-proxy 设计文档
 
 > Trae CN(企业版)→ OpenAI / Anthropic 兼容 API 网关
-> 状态:**demo 已验证通过,待确认后进入正式开发**
+> 状态:**动态模型目录与 TRAE IDE Agent bridge 已验证通过**
 
 ---
 
@@ -19,6 +19,7 @@
 | 8 | 企业网络必须走 HTTP 代理 | 本机 `hkproxy.mindray.com:8080`(环境变量注入);直连失败、经代理成功 |
 | 9 | C# tc 加解密与 Node 参考实现双向互通 | 本项目 C# 加密结果被 laojichao/trae-local-api 的 JS 成功解密;JS 加密数据被 C# 成功解密 |
 | 10 | `llm_utils_chat` 会忽略模型选择并回落租户默认模型 | 实测请求 `glm-5.2__max` 后 metadata 仍为 `Doubao-Seed-Evolving`;代理现会拒绝模型不匹配的响应，避免将错模型结果返回给调用方 |
+| 11 | TRAE IDE Agent 链路可按目录中的精确模型 ID 调用 | 通过 CDP 页面初始化 hook 复用 TRAE 产品会话创建与 Aha IPC；已实测 `glm-5.3__dev`、`DeepSeek-V4-Pro-Official__dev`、`kimi-k2.7-code__dev`，并严格校验返回 metadata |
 
 ### demo 已验证功能清单
 
@@ -27,7 +28,9 @@
 - [x] 完全无授权时:独立网页授权(浏览器 `/authorization` + PKCE → 本地回调捕获 refreshToken → ExchangeToken),不依赖 IDE
 - [x] 后台定时刷新服务(每 30 分钟检查,过期前 1 小时续期)
 - [x] OpenAI 兼容:`GET /v1/models`、`POST /v1/chat/completions`(流式+非流式)
+- [x] OpenAI Responses 兼容:`POST /v1/responses`(流式+非流式)
 - [x] Anthropic 兼容:`POST /v1/messages`(流式事件序列符合规范)
+- [x] 动态模型目录与 TRAE IDE Agent 精确选模，模型不匹配时明确失败
 - [x] 网关 API Key 鉴权(401/200 正确)
 - [x] 代理支持(读 `HTTPS_PROXY` 环境变量)
 
@@ -47,9 +50,9 @@ sub2api / one-api / Claude Code / 其他工具
 │  │ opic ↔ Trae   │ │  detail_param)│ │
 │  └──────┬────────┘ └──────┬───────┘ │
 │  ┌──────┴─────────────────┴───────┐ │
-│  │        TraeClient(上游)         │ │
-│  │  Cloud-IDE-JWT + 设备头 + 代理  │ │
-│  └──────┬─────────────────────────┘ │
+│  │ TraeClient(目录/授权) │ IDE Bridge│ │
+│  │ HTTP + 企业代理       │ CDP + Aha │ │
+│  └──────┬─────────────────┴─────────┘ │
 │  ┌──────┴──────┐  ┌────────────────┐│
 │  │ TokenStore   │  │ TokenRefresh   ││
 │  │ 缓存+解密+回写│◄─┤ 定时/触发续期  ││
@@ -86,7 +89,9 @@ console.enterprise.trae.cn(上游,经企业代理)
 
 ### 3.4 协议转换层(demo 已有雏形,正式版增强)
 - OpenAI:`/v1/chat/completions`(流式/非流式),`/v1/models`(来自模型目录,按 config_name 分组)。
+- OpenAI Responses:`/v1/responses`(流式/非流式)。
 - Anthropic:`/v1/messages` + `/v1/messages/count_tokens`。
+- 可选模型对话通过当前 TRAE IDE Agent 执行；首次请求安装初始化 hook 并重载 workbench，请求串行化，实际模型 metadata 必须与请求 ID 一致。
 - **待增强**:tool_use/tool_result 结构化往返(参考 laojichao 项目的 `<tool_call>` 解析策略)、reasoning_content 与 response 的分离输出、Anthropic 严格交错校验(role 交替)。
 
 ### 3.5 TokenRefreshService(已实现,待实测)
@@ -129,7 +134,7 @@ console.enterprise.trae.cn(上游,经企业代理)
 
 ## 4. 已知问题 / 待解决(按优先级)
 
-1. **模型选择**(高):已确认 `llm_utils_chat` 不按 `model`、`currentConfigInfo`、`modeType`、`accessType` 切换模型。通用对话要支持多模型，必须抓取 IDE 主聊天的真实请求或完成 `create_agent_task` 协议逆向；后者目前仅确认用于代码代理任务，不能直接替换 OpenAI 对话。
+1. **IDE bridge 稳定性**(高):模型选择已通过产品 UI/Aha 事件链解决；TRAE 升级后 DOM 选择器或 IPC 事件结构可能变化，需要用端到端探针及时发现。bridge 绑定当前 IDE 登录账号并串行执行，不参与多账号负载均衡。
 2. **ExchangeToken 实测**(高):8-30 前后自动触发或手动把 `expiredAt` 改早触发,确认响应字段与轮换副作用。
 3. **reasoning 输出混入 response**(中):部分模型把思考内容放在 `response` 字段;需按 `reasoning_content` 分离处理。
 4. **多端 token 竞争**(中):网关与 IDE 同时刷新会互相轮换。方案:以 storage.json 为准的单写者(刷新互斥 + 回写),或网关刷新后立即回写并在 30s 内不回读旧缓存。
@@ -151,7 +156,7 @@ console.enterprise.trae.cn(上游,经企业代理)
 ## 6. 后续开发计划
 
 - **阶段 1(多账号基础)**:账号存储、统一 API 选择、会话粘滞、JSON 导入、管理端 OAuth 和账号级刷新已完成；后续补充失败冷却、流式输出前 failover 和更多测试。
-- **阶段 2(协议增强)**:模型选择问题(#1)→ reasoning 分离(#3)→ Anthropic tool_use/count_tokens → 模型映射表。
+- **阶段 2(协议增强)**:IDE bridge 稳定性与错误恢复(#1)→ reasoning 分离(#3)→ Anthropic tool_use/count_tokens。
 - **阶段 3(运维)**:账号用量统计、日志轮转、优雅停机、Docker 部署说明；如需多实例再引入数据库和分布式锁。
 
 ---
@@ -173,5 +178,5 @@ sub2api / one-api 接入示例:
 ```bash
 curl http://127.0.0.1:9220/v1/chat/completions \
   -H "Authorization: Bearer my-key" -H "Content-Type: application/json" \
-  -d '{"model":"glm-5.2__max","messages":[{"role":"user","content":"你好"}]}'
+  -d '{"model":"glm-5.3__dev","messages":[{"role":"user","content":"你好"}]}'
 ```
