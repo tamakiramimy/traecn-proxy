@@ -4,13 +4,45 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version stamped into the build (no leading v)"
+        required: false
+        default: "0.0.0-dev"
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "true"
+
 jobs:
+  test:
+    name: Build & test
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Test
+        run: >-
+          dotnet test tests/TrancnProxy.Tests/TrancnProxy.Tests.csproj
+          --configuration Release
+
   publish:
     name: Publish ${{ matrix.rid }}
+    needs: test
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -20,6 +52,8 @@ jobs:
           - osx-arm64
           - win-x64
           - win-arm64
+          - linux-x64
+          - linux-arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -32,9 +66,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            label="${GITHUB_REF_NAME}"
+          else
+            label="v${{ inputs.version }}"
+          fi
+          version="${label#v}"
+
           output="publish/${{ matrix.rid }}"
-          archive="trancn-proxy-${GITHUB_REF_NAME}-${{ matrix.rid }}.zip"
+          archive="trancn-proxy-${label}-${{ matrix.rid }}.zip"
 
           dotnet publish TrancnProxy.csproj \
             --configuration Release \
@@ -63,6 +104,7 @@ jobs:
   release:
     name: Create GitHub Release
     needs: publish
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
 
     steps:

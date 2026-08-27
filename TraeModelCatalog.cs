@@ -76,6 +76,7 @@ public sealed class TraeModelCatalogCache
 {
     private static readonly TimeSpan DefaultTimeToLive = TimeSpan.FromMinutes(5);
     private readonly Func<CancellationToken, Task<JsonNode>> _loadCatalog;
+    private readonly Func<JsonNode?, DateTimeOffset?, TraeModelCatalogSnapshot> _parseCatalog;
     private readonly TimeProvider _timeProvider;
     private readonly TimeSpan _timeToLive;
     private readonly SemaphoreSlim _refreshGate = new(1, 1);
@@ -85,16 +86,19 @@ public sealed class TraeModelCatalogCache
     /// <param name="loadCatalog">Loads one raw catalog response.</param>
     /// <param name="timeProvider">Provides time for expiration checks.</param>
     /// <param name="timeToLive">Controls snapshot lifetime.</param>
+    /// <param name="parseCatalog">Parses one raw catalog response.</param>
     public TraeModelCatalogCache(
         Func<CancellationToken, Task<JsonNode>> loadCatalog,
         TimeProvider? timeProvider = null,
-        TimeSpan? timeToLive = null)
+        TimeSpan? timeToLive = null,
+        Func<JsonNode?, DateTimeOffset?, TraeModelCatalogSnapshot>? parseCatalog = null)
     {
         ArgumentNullException.ThrowIfNull(loadCatalog);
         if (timeToLive <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(timeToLive), "Catalog TTL must be greater than zero.");
 
         _loadCatalog = loadCatalog;
+        _parseCatalog = parseCatalog ?? TraeModelCatalogParser.Parse;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _timeToLive = timeToLive ?? DefaultTimeToLive;
     }
@@ -119,7 +123,7 @@ public sealed class TraeModelCatalogCache
             if (force && snapshot is not null && !ReferenceEquals(snapshot, snapshotBeforeWait)) return snapshot;
 
             JsonNode rawCatalog = await _loadCatalog(cancellationToken).ConfigureAwait(false);
-            var refreshed = TraeModelCatalogParser.Parse(rawCatalog, _timeProvider.GetUtcNow());
+            var refreshed = _parseCatalog(rawCatalog, _timeProvider.GetUtcNow());
             Volatile.Write(ref _snapshot, refreshed);
             return refreshed;
         }
@@ -217,7 +221,6 @@ public static class TraeModelCatalogParser
     private static JsonArray RequiredArray(JsonObject owner, string propertyName, string ownerName) =>
         owner[propertyName] as JsonArray
         ?? throw new TraeModelCatalogException($"{ownerName}.{propertyName} must be an array.");
-
     private static string RequiredString(JsonObject owner, string propertyName, string ownerName)
     {
         string value = StringValue(owner[propertyName]);
@@ -247,5 +250,43 @@ public static class TraeModelCatalogParser
         if (modelId.EndsWith("__dev", StringComparison.Ordinal)) return TraeModelVariant.Dev;
         if (modelId.EndsWith("__max", StringComparison.Ordinal)) return TraeModelVariant.Max;
         return TraeModelVariant.Other;
+    }
+
+    /// <summary>Parses the standalone chat service <c>get_detail_param</c> catalog.</summary>
+    /// <param name="catalog">The raw catalog response.</param>
+    /// <param name="retrievedAt">The retrieval time, or UTC now when omitted.</param>
+    /// <returns>The selectable model snapshot keyed by config name.</returns>
+    /// <exception cref="TraeModelCatalogException">The response schema is invalid.</exception>
+    public static TraeModelCatalogSnapshot ParseChatConfigs(JsonNode? catalog, DateTimeOffset? retrievedAt = null)
+    {
+        if (catalog is not JsonObject root)
+            throw new TraeModelCatalogException("Chat model catalog root must be an object.");
+
+        var configInfos = (root["config_info_list"]
+            ?? root["Result"]?["config_info_list"]
+            ?? root["data"]?["config_info_list"]) as JsonArray
+            ?? throw new TraeModelCatalogException("Chat model catalog has no config_info_list array.");
+
+        var descriptors = new List<TraeModelDescriptor>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var config in configInfos.OfType<JsonObject>())
+        {
+            string configName = StringValue(config["config_name"]);
+            if (string.IsNullOrWhiteSpace(configName) || !seen.Add(configName)) continue;
+            if (OptionalBoolean(config, "is_invisible_to_user", configName) == true) continue;
+
+            string displayName = StringValue(config["display_config"]?["display_name"]);
+            // 该服务面按 config_name 选模型，model_detail_list 里的 __dev/__max 只是内部变体。
+            descriptors.Add(new TraeModelDescriptor(
+                configName,
+                configName,
+                string.IsNullOrWhiteSpace(displayName) ? configName : displayName,
+                GetVariant(configName)));
+        }
+
+        if (descriptors.Count == 0)
+            throw new TraeModelCatalogException("Chat model catalog contains no selectable configurations.");
+
+        return new TraeModelCatalogSnapshot(descriptors, retrievedAt ?? DateTimeOffset.UtcNow);
     }
 }

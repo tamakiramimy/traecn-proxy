@@ -51,11 +51,18 @@ public class TraeClient
         _http = httpMessageHandler is null
             ? BuildHttpClient()
             : new HttpClient(httpMessageHandler, disposeHandler: false) { Timeout = TimeSpan.FromMinutes(10) };
-        _modelCatalog = new TraeModelCatalogCache(FetchModelCatalogAsync);
+        _modelCatalog = new TraeModelCatalogCache(
+            FetchModelCatalogAsync,
+            parseCatalog: _usesExternalChatApiHost
+                ? TraeModelCatalogParser.ParseChatConfigs
+                : TraeModelCatalogParser.Parse);
     }
 
     public string ApiHost => _apiHost;
     public string ChatApiHost => _chatApiHost;
+
+    /// <summary>Gets whether chat runs on a standalone service face instead of the enterprise control plane.</summary>
+    public bool UsesExternalChatApiHost => _usesExternalChatApiHost;
 
     /// <summary>Sends a JSON request with the authenticated TRAE client headers and proxy configuration.</summary>
     public Task<HttpResponseMessage> SendJsonAsync(
@@ -175,6 +182,8 @@ public class TraeClient
 
     private async Task<JsonNode> FetchModelCatalogAsync(CancellationToken ct)
     {
+        if (_usesExternalChatApiHost) return await FetchChatModelCatalogAsync(ct);
+
         var body = new JsonObject
         {
             ["functions"] = new JsonArray("chat_v3", "chat", "inline_chat"),
@@ -205,12 +214,11 @@ public class TraeClient
     /// <summary>Lists the model config names selectable on the configured chat service.</summary>
     /// <param name="ct">Cancels the request.</param>
     /// <returns>Config names paired with their nested model names.</returns>
-    public async Task<IReadOnlyList<(string ConfigName, IReadOnlyList<string> ModelNames)>> GetChatModelConfigsAsync(
-        CancellationToken ct = default)
+    private async Task<JsonNode> FetchChatModelCatalogAsync(CancellationToken ct)
     {
         var body = new JsonObject
         {
-            ["function"] = _usesExternalChatApiHost ? SoloChatFunction : "inline_chat",
+            ["function"] = SoloChatFunction,
             ["config_names"] = null,
             ["need_prompt"] = false,
             ["current_config_info"] = null,
@@ -219,32 +227,14 @@ public class TraeClient
             ["agent_type"] = null
         };
         var req = new HttpRequestMessage(HttpMethod.Post, $"{_chatApiHost}/api/ide/v1/get_detail_param");
-        AddHeaders(req, _usesExternalChatApiHost, streaming: false);
+        AddHeaders(req, useSoloChatProfile: true, streaming: false);
         req.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
         using var resp = await _http.SendAsync(req, ct);
         string raw = await resp.Content.ReadAsStringAsync(ct);
         if (!resp.IsSuccessStatusCode)
-            throw new InvalidOperationException($"get_detail_param {resp.StatusCode}: {Truncate(raw, 300)}");
-
-        var root = JsonNode.Parse(raw) as JsonObject
+            throw new TraeModelCatalogException($"get_detail_param {resp.StatusCode}: {Truncate(raw, 300)}");
+        return JsonNode.Parse(raw)
             ?? throw new TraeModelCatalogException("get_detail_param response is empty.");
-        var configs = (root["config_info_list"] ?? root["Result"]?["config_info_list"] ?? root["data"]?["config_info_list"]) as JsonArray
-            ?? throw new TraeModelCatalogException($"get_detail_param response has no config_info_list: {Truncate(raw, 300)}");
-
-        var results = new List<(string, IReadOnlyList<string>)>();
-        foreach (var entry in configs.OfType<JsonObject>())
-        {
-            string? configName = (string?)entry["config_name"];
-            if (string.IsNullOrWhiteSpace(configName)) continue;
-            var modelNames = (entry["model_detail_list"] as JsonArray)?
-                .OfType<JsonObject>()
-                .Select(model => (string?)model["model_name"])
-                .Where(name => !string.IsNullOrWhiteSpace(name))
-                .Select(name => name!)
-                .ToArray() ?? [];
-            results.Add((configName!, modelNames));
-        }
-        return results;
     }
 
     private async IAsyncEnumerable<TraeSseEvent> ChatStreamCore(

@@ -130,8 +130,9 @@ if (listChatModels)
 {
     using var modelLease = accountManager.AcquireByAlias(accountAlias);
     Console.WriteLine($"--- chat 服务面模型表: {modelLease.Client.ChatApiHost} ---");
-    foreach (var (configName, modelNames) in await modelLease.Client.GetChatModelConfigsAsync())
-        Console.WriteLine(modelNames.Count == 0 ? configName : $"{configName}  ({string.Join(", ", modelNames)})");
+    var chatCatalog = await modelLease.Client.GetModelCatalogAsync();
+    foreach (var chatModel in chatCatalog.Models)
+        Console.WriteLine($"{chatModel.Id,-32} {chatModel.DisplayName}");
     return 0;
 }
 
@@ -238,6 +239,7 @@ app.Use(async (ctx, next) =>
 app.MapGet("/v1/status", async (CancellationToken ct) => new
 {
     ok = true,
+    chat_upstream = string.IsNullOrWhiteSpace(chatApiHost) ? "ide_bridge" : chatApiHost,
     ide_bridge = new
     {
         enabled = ideBridge is not null,
@@ -295,8 +297,8 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx) =>
     TraeModelDescriptor descriptor;
     try { descriptor = await lease.Client.ResolveModelAsync(model, ct); }
     catch (TraeModelNotFoundException) { return UnsupportedModel(model); }
-    if (ideBridge is null) return IdeBridgeDisabled();
-    var upstream = ideBridge.ChatStreamAsync(messages, descriptor, ct);
+    if (!lease.Client.UsesExternalChatApiHost && ideBridge is null) return IdeBridgeDisabled();
+    var upstream = ChatUpstream(lease, messages, descriptor, ct);
     if (stream)
     {
         ctx.Response.ContentType = "text/event-stream";
@@ -321,8 +323,8 @@ app.MapPost("/v1/responses", async (HttpContext ctx) =>
     TraeModelDescriptor descriptor;
     try { descriptor = await lease.Client.ResolveModelAsync(model, ct); }
     catch (TraeModelNotFoundException) { return UnsupportedModel(model); }
-    if (ideBridge is null) return IdeBridgeDisabled();
-    var upstream = ideBridge.ChatStreamAsync(messages, descriptor, ct);
+    if (!lease.Client.UsesExternalChatApiHost && ideBridge is null) return IdeBridgeDisabled();
+    var upstream = ChatUpstream(lease, messages, descriptor, ct);
     string respId = $"resp_{Guid.NewGuid():N}";
     if (stream)
     {
@@ -347,8 +349,8 @@ app.MapPost("/v1/messages", async (HttpContext ctx) =>
     TraeModelDescriptor descriptor;
     try { descriptor = await lease.Client.ResolveModelAsync(model, ct); }
     catch (TraeModelNotFoundException) { return UnsupportedModel(model); }
-    if (ideBridge is null) return IdeBridgeDisabled();
-    var upstream = ideBridge.ChatStreamAsync(messages, descriptor, ct);
+    if (!lease.Client.UsesExternalChatApiHost && ideBridge is null) return IdeBridgeDisabled();
+    var upstream = ChatUpstream(lease, messages, descriptor, ct);
     if (stream)
     {
         ctx.Response.ContentType = "text/event-stream";
@@ -546,6 +548,13 @@ string ContentOf(JsonNode? content) => content switch
     })),
     _ => ""
 };
+
+// 配置了独立 chat 服务面时直连，否则回落到需要 IDE 在线的 bridge。
+IAsyncEnumerable<TraeSseEvent> ChatUpstream(
+    AccountLease lease, List<(string role, string text)> messages, TraeModelDescriptor descriptor, CancellationToken ct) =>
+    lease.Client.UsesExternalChatApiHost
+        ? lease.Client.ChatStreamAsync(messages, descriptor.ConfigName, ct)
+        : ideBridge!.ChatStreamAsync(messages, descriptor, ct);
 
 IResult UnsupportedModel(string model) => Results.BadRequest(new
 {
