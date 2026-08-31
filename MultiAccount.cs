@@ -40,6 +40,17 @@ public static class TraeConcurrencyLimits
     }
 }
 
+public sealed class TraeConcurrencyQueueTimeoutException : Exception
+{
+    public TraeConcurrencyQueueTimeoutException(TimeSpan waited)
+        : base($"等待 Trae 账号并发槽位超过 {waited.TotalSeconds:F0} 秒。")
+    {
+        Waited = waited;
+    }
+
+    public TimeSpan Waited { get; }
+}
+
 public sealed class TraeAccountStore
 {
     private readonly object _writeGate = new();
@@ -156,6 +167,7 @@ internal sealed class TraeAccountRuntime
 
 public sealed class MultiAccountManager
 {
+    private static readonly TimeSpan QueuePollInterval = TimeSpan.FromMilliseconds(120);
     private readonly TraeAccountStore _store;
     private readonly string? _chatApiHost;
     private readonly object _selectionGate = new();
@@ -173,6 +185,8 @@ public sealed class MultiAccountManager
         foreach (var account in Settings.Accounts)
             _accounts[account.Id] = new TraeAccountRuntime(account, _chatApiHost);
     }
+
+    public TimeSpan QueueTimeout { get; set; } = TimeSpan.FromSeconds(150);
 
     public MultiAccountSettings Settings { get; private set; }
 
@@ -318,7 +332,24 @@ public sealed class MultiAccountManager
         }
     }
 
-    public AccountLease Acquire(string? sessionKey)
+    public AccountLease Acquire(string? sessionKey) =>
+        TryAcquireLease(sessionKey, out AccountLease? lease) && lease is not null
+            ? lease
+            : throw new InvalidOperationException("所有 Trae 账号均达到并发上限。");
+
+    // 上游对单账号并发很敏感，排队等待比直接拒绝更能避免客户端反复重试。
+    public async Task<AccountLease> AcquireAsync(string? sessionKey, CancellationToken ct = default)
+    {
+        DateTimeOffset deadline = DateTimeOffset.UtcNow + QueueTimeout;
+        while (true)
+        {
+            if (TryAcquireLease(sessionKey, out AccountLease? lease) && lease is not null) return lease;
+            if (DateTimeOffset.UtcNow >= deadline) throw new TraeConcurrencyQueueTimeoutException(QueueTimeout);
+            await Task.Delay(QueuePollInterval, ct);
+        }
+    }
+
+    public bool TryAcquireLease(string? sessionKey, out AccountLease? lease)
     {
         lock (_selectionGate)
         {
@@ -331,13 +362,19 @@ public sealed class MultiAccountManager
             {
                 selected = OrderCandidates(candidates)
                     .Where(x => !ReferenceEquals(x, selected))
-                    .FirstOrDefault(x => x.TryAcquire())
-                    ?? throw new InvalidOperationException("所有 Trae 账号均达到并发上限。");
+                    .FirstOrDefault(x => x.TryAcquire());
+            }
+
+            if (selected is null)
+            {
+                lease = null;
+                return false;
             }
 
             if (!string.IsNullOrWhiteSpace(sessionKey))
                 _sessions[sessionKey] = new SessionBinding(selected.Account.Id, DateTimeOffset.UtcNow.AddMinutes(Settings.SessionTtlMinutes));
-            return new AccountLease(selected);
+            lease = new AccountLease(selected);
+            return true;
         }
     }
 

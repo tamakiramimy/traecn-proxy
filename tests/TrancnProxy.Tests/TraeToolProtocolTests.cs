@@ -170,4 +170,59 @@ public sealed class TraeToolProtocolTests
         thinking.Should().Be("需要写文件");
         blocks.OfType<TraeToolUseStartBlock>().Should().ContainSingle().Which.Name.Should().Be("write_file");
     }
+
+    [TestMethod]
+    public void StreamParser_ParsesDeepSeekDsmlToolCall()
+    {
+        var parser = new TraeToolProtocol.StreamParser(streamToolCalls: true);
+        var blocks = new List<TraeOutputBlock>();
+
+        blocks.AddRange(parser.Push("我来看一下当前目录。\n<tool_calls>\n"));
+        blocks.AddRange(parser.Push("<｜DSML｜ name=\"Bash\">\n<parameter name=\"command\">ls -la /tmp</parameter>\n"));
+        blocks.AddRange(parser.Push("<parameter name=\"description\">List files</parameter>\n</｜DSML｜>"));
+        blocks.AddRange(parser.Complete());
+
+        blocks.OfType<TraeToolUseStartBlock>().Should().ContainSingle().Which.Name.Should().Be("Bash");
+        string input = string.Concat(blocks.OfType<TraeToolInputDeltaBlock>().Select(block => block.PartialJson));
+        JsonNode parsed = JsonNode.Parse(input)!;
+        parsed["command"]!.GetValue<string>().Should().Be("ls -la /tmp");
+        parsed["description"]!.GetValue<string>().Should().Be("List files");
+        blocks.OfType<TraeToolUseEndBlock>().Should().ContainSingle();
+
+        string text = string.Concat(blocks.OfType<TraeTextBlock>().Select(block => block.Text));
+        text.Should().NotContain("tool_calls").And.NotContain("DSML");
+        text.Trim().Should().Be("我来看一下当前目录。");
+    }
+
+    [TestMethod]
+    public void StreamParser_ParsesInvokeStyleToolCallWithTypedParameters()
+    {
+        var blocks = TraeToolProtocol.Parse(
+            "<function_calls><invoke name=\"Read\">" +
+            "<parameter name=\"file_path\">/tmp/a.txt</parameter>" +
+            "<parameter name=\"limit\">50</parameter>" +
+            "<parameter name=\"raw\">true</parameter>" +
+            "</invoke></function_calls>");
+
+        blocks.OfType<TraeToolUseStartBlock>().Should().ContainSingle().Which.Name.Should().Be("Read");
+        JsonNode parsed = JsonNode.Parse(string.Concat(
+            blocks.OfType<TraeToolInputDeltaBlock>().Select(block => block.PartialJson)))!;
+        parsed["file_path"]!.GetValue<string>().Should().Be("/tmp/a.txt");
+        parsed["limit"]!.GetValue<int>().Should().Be(50);
+        parsed["raw"]!.GetValue<bool>().Should().BeTrue();
+    }
+
+    [TestMethod]
+    public void StreamParser_KeepsHtmlTextIntact()
+    {
+        var parser = new TraeToolProtocol.StreamParser(streamToolCalls: true);
+        var blocks = new List<TraeOutputBlock>();
+
+        blocks.AddRange(parser.Push("<!DOCTYPE html>\n<div class=\"a\">hi</div>"));
+        blocks.AddRange(parser.Complete());
+
+        string text = string.Concat(blocks.OfType<TraeTextBlock>().Select(block => block.Text));
+        text.Should().Be("<!DOCTYPE html>\n<div class=\"a\">hi</div>");
+        blocks.OfType<TraeToolUseStartBlock>().Should().BeEmpty();
+    }
 }

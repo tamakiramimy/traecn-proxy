@@ -233,6 +233,21 @@ app.Use(async (ctx, next) =>
 
 app.Use(async (ctx, next) =>
 {
+    try { await next(); }
+    catch (TraeConcurrencyQueueTimeoutException ex) when (!ctx.Response.HasStarted)
+    {
+        ctx.Response.StatusCode = 429;
+        ctx.Response.Headers.RetryAfter = "5";
+        await ctx.Response.WriteAsJsonAsync(new
+        {
+            type = "error",
+            error = new { type = "rate_limit_error", message = ex.Message }
+        });
+    }
+});
+
+app.Use(async (ctx, next) =>
+{
     bool isBusinessApi = ctx.Request.Path.StartsWithSegments("/v1");
     bool isAdminApi = ctx.Request.Path.StartsWithSegments("/admin/api");
     if ((isBusinessApi && !string.IsNullOrEmpty(gatewayKey)) || (isAdminApi && !string.IsNullOrEmpty(adminKey)))
@@ -312,7 +327,7 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx) =>
     if (messages.Count == 0)
         return Results.BadRequest(new { error = new { message = "messages is required", type = "invalid_request_error" } });
 
-    using var lease = accountManager.Acquire(SessionKey(ctx, body));
+    using var lease = await accountManager.AcquireAsync(SessionKey(ctx, body), ct);
     TraeModelDescriptor descriptor;
     try { descriptor = await lease.Client.ResolveModelAsync(model, ct); }
     catch (TraeModelNotFoundException) { return UnsupportedModel(model); }
@@ -337,7 +352,7 @@ app.MapPost("/v1/responses", async (HttpContext ctx) =>
     if (messages.Count == 0)
         return Results.BadRequest(new { error = new { message = "input is required", type = "invalid_request_error" } });
 
-    using var lease = accountManager.Acquire(SessionKey(ctx, body));
+    using var lease = await accountManager.AcquireAsync(SessionKey(ctx, body), ct);
     TraeModelDescriptor descriptor;
     try { descriptor = await lease.Client.ResolveModelAsync(model, ct); }
     catch (TraeModelNotFoundException) { return UnsupportedModel(model); }
@@ -362,7 +377,7 @@ app.MapPost("/v1/messages", async (HttpContext ctx) =>
     if (messages.Count == 0)
         return Results.BadRequest(new { type = "error", error = new { message = "messages is required", type = "invalid_request_error" } });
 
-    using var lease = accountManager.Acquire(SessionKey(ctx, body));
+    using var lease = await accountManager.AcquireAsync(SessionKey(ctx, body), ct);
     TraeModelDescriptor descriptor;
     try { descriptor = await lease.Client.ResolveModelAsync(model, ct); }
     catch (TraeModelNotFoundException) { return UnsupportedModel(model); }

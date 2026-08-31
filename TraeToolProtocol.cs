@@ -31,6 +31,27 @@ public static class TraeToolProtocol
         ("<thinking>", "</thinking>"),
         ("<think>", "</think>")
     };
+
+    // 模型常以自身原生 XML 语法发起工具调用（DeepSeek 用全角 ｜DSML｜），需与 <tool_call> JSON 一并识别。
+    private static readonly Regex XmlToolOpen = new(
+        "<(?<tag>｜DSML｜|antml:invoke|invoke|function_call)\\s+name\\s*=\\s*[\"'](?<name>[^\"']+)[\"']\\s*>",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex XmlToolParameter = new(
+        "<parameter\\s+name\\s*=\\s*[\"'](?<key>[^\"']+)[\"']\\s*>(?<value>.*?)</parameter>",
+        RegexOptions.Compiled | RegexOptions.Singleline | RegexOptions.CultureInvariant);
+    private static readonly Regex XmlToolWrapper = new(
+        "</?(?:antml:)?(?:tool_calls|function_calls)\\s*>",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex NumericParameter = new(
+        @"^-?(?:0|[1-9]\d*)(?:\.\d+)?$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly string[] PartialGuards =
+    {
+        OpenTag, "<thinking>", "<think>",
+        "<｜DSML｜", "<invoke", "<invoke", "<function_call",
+        "<tool_calls>", "<function_calls>", "<function_calls>",
+        "</tool_calls>", "</function_calls>", "</function_calls>"
+    };
     private static readonly Regex EnglishAction = new(
         @"\b(create|write|build|implement|modify|edit|fix|delete|rename|move|run|execute|install|test|inspect|search|read|open)\b",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
@@ -145,6 +166,8 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
         private bool _toolCallStarted;
         private bool _inThinking;
         private string _thinkingCloseTag = "";
+        private bool _inXmlTool;
+        private string _xmlToolCloseTag = "";
 
         public StreamParser(bool streamToolCalls = false)
         {
@@ -193,6 +216,24 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
                     _buffer.Remove(0, thinkingCloseIndex + _thinkingCloseTag.Length);
                     blocks.Add(new TraeThinkingEndBlock());
                     _inThinking = false;
+                    continue;
+                }
+
+                if (_inXmlTool)
+                {
+                    int xmlCloseIndex = buffered.IndexOf(_xmlToolCloseTag, StringComparison.Ordinal);
+                    if (xmlCloseIndex < 0)
+                    {
+                        if (!final) break;
+                        EmitXmlToolInput(blocks, buffered);
+                        _buffer.Clear();
+                        _inXmlTool = false;
+                        break;
+                    }
+
+                    EmitXmlToolInput(blocks, buffered[..xmlCloseIndex]);
+                    _buffer.Remove(0, xmlCloseIndex + _xmlToolCloseTag.Length);
+                    _inXmlTool = false;
                     continue;
                 }
 
@@ -291,8 +332,27 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
                     continue;
                 }
 
-                int retainedLength = final ? 0 : PartialOpenTagLength(buffered);
-                int textLength = buffered.Length - retainedLength;
+                Match xmlTool = XmlToolOpen.Match(buffered);
+                Match xmlWrapper = XmlToolWrapper.Match(buffered);
+                bool wrapperFirst = xmlWrapper.Success && (!xmlTool.Success || xmlWrapper.Index < xmlTool.Index);
+                if (xmlTool.Success && !wrapperFirst)
+                {
+                    if (xmlTool.Index > 0) blocks.Add(new TraeTextBlock(buffered[..xmlTool.Index]));
+                    _buffer.Remove(0, xmlTool.Index + xmlTool.Length);
+                    _inXmlTool = true;
+                    _xmlToolCloseTag = $"</{xmlTool.Groups["tag"].Value}>";
+                    blocks.Add(new TraeToolUseStartBlock($"toolu_{Guid.NewGuid():N}", xmlTool.Groups["name"].Value));
+                    continue;
+                }
+
+                if (wrapperFirst)
+                {
+                    if (xmlWrapper.Index > 0) blocks.Add(new TraeTextBlock(buffered[..xmlWrapper.Index]));
+                    _buffer.Remove(0, xmlWrapper.Index + xmlWrapper.Length);
+                    continue;
+                }
+
+                int textLength = final ? buffered.Length : SafeTextLength(buffered);
                 if (textLength > 0)
                 {
                     blocks.Add(new TraeTextBlock(buffered[..textLength]));
@@ -377,12 +437,41 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
             return -1;
         }
 
-        private static int PartialOpenTagLength(string value)
+        // 属性标签长度不固定，只能以末尾未闭合的 '<' 作为切分点。
+        private static int SafeTextLength(string value)
         {
-            int retained = PartialTagLength(value, OpenTag);
-            foreach (var tag in ThinkingTags)
-                retained = Math.Max(retained, PartialTagLength(value, tag.Open));
-            return retained;
+            int lastOpen = value.LastIndexOf('<');
+            if (lastOpen < 0) return value.Length;
+            string tail = value[lastOpen..];
+            if (tail.Contains('>')) return value.Length;
+            foreach (string guard in PartialGuards)
+            {
+                if (guard.StartsWith(tail, StringComparison.Ordinal) || tail.StartsWith(guard, StringComparison.Ordinal))
+                    return lastOpen;
+            }
+            return value.Length;
+        }
+
+        private static void EmitXmlToolInput(List<TraeOutputBlock> blocks, string body)
+        {
+            var input = new JsonObject();
+            foreach (Match parameter in XmlToolParameter.Matches(body))
+                input[parameter.Groups["key"].Value] = ParameterValue(parameter.Groups["value"].Value);
+            blocks.Add(new TraeToolInputDeltaBlock(input.ToJsonString()));
+            blocks.Add(new TraeToolUseEndBlock());
+        }
+
+        private static JsonNode? ParameterValue(string raw)
+        {
+            string trimmed = raw.Trim();
+            if (trimmed.Length > 0 && (trimmed[0] == '{' || trimmed[0] == '['))
+            {
+                try { return JsonNode.Parse(trimmed); }
+                catch (System.Text.Json.JsonException) { }
+            }
+            if (trimmed is "true" or "false") return JsonValue.Create(trimmed == "true");
+            if (NumericParameter.IsMatch(trimmed)) return JsonNode.Parse(trimmed);
+            return JsonValue.Create(raw);
         }
 
         private static int PartialCloseTagLength(string value) => PartialTagLength(value, CloseTag);
