@@ -24,6 +24,7 @@ public sealed class TraeToolProtocolTests
         prompt.Should().Contain("<tool_call>");
         prompt.Should().Contain("write_file");
         prompt.Should().Contain("input_schema");
+        prompt.Should().Contain("MUST use the appropriate tools");
     }
 
     [TestMethod]
@@ -36,6 +37,43 @@ public sealed class TraeToolProtocolTests
 
         prompt.Should().Contain("MUST call the 'write_file' tool");
         prompt.Should().Contain("Do not answer with prose");
+    }
+
+    [TestMethod]
+    public void ShouldForceToolUse_RequiresExecutionForWorkspaceActionOnly()
+    {
+        var tools = new JsonArray(new JsonObject { ["name"] = "write_file" });
+        var action = new JsonArray(new JsonObject
+        {
+            ["role"] = "user",
+            ["content"] = "帮我写一个 H5 赛车游戏"
+        });
+        var question = new JsonArray(new JsonObject
+        {
+            ["role"] = "user",
+            ["content"] = "解释一下赛车游戏的难度设计"
+        });
+
+        TraeToolProtocol.ShouldForceToolUse(action, tools, new JsonObject { ["type"] = "auto" }).Should().BeTrue();
+        TraeToolProtocol.ShouldForceToolUse(question, tools, new JsonObject { ["type"] = "auto" }).Should().BeFalse();
+    }
+
+    [TestMethod]
+    public void ShouldForceToolUse_DoesNotRepeatAfterToolResult()
+    {
+        var tools = new JsonArray(new JsonObject { ["name"] = "write_file" });
+        var messages = new JsonArray(new JsonObject
+        {
+            ["role"] = "user",
+            ["content"] = new JsonArray(new JsonObject
+            {
+                ["type"] = "tool_result",
+                ["tool_use_id"] = "toolu_1",
+                ["content"] = "File created"
+            })
+        });
+
+        TraeToolProtocol.ShouldForceToolUse(messages, tools, new JsonObject { ["type"] = "auto" }).Should().BeFalse();
     }
 
     [TestMethod]
@@ -67,5 +105,23 @@ public sealed class TraeToolProtocolTests
 
         tools.Select(tool => tool.Name).Should().Equal("read_file", "write_file");
         tools.Select(tool => tool.Input["path"]!.GetValue<string>()).Should().Equal("a.txt", "b.txt");
+    }
+
+    [TestMethod]
+    public void StreamParser_StreamsToolNameAndArgumentsBeforeClosingTag()
+    {
+        var parser = new TraeToolProtocol.StreamParser(streamToolCalls: true);
+
+        var first = parser.Push("<tool_call>{\"name\":\"write_file\",\"arguments\":{\"path\":\"index.html\",\"content\":\"<html>");
+
+        first.OfType<TraeToolUseStartBlock>().Should().ContainSingle().Which.Name.Should().Be("write_file");
+        first.OfType<TraeToolInputDeltaBlock>().Should().NotBeEmpty();
+
+        var remaining = parser.Push("game</html>\"}}</tool_call>").Concat(parser.Complete()).ToList();
+        string streamedJson = string.Concat(first.Concat(remaining).OfType<TraeToolInputDeltaBlock>().Select(block => block.PartialJson));
+
+        JsonNode.Parse(streamedJson)!["path"]!.GetValue<string>().Should().Be("index.html");
+        JsonNode.Parse(streamedJson)!["content"]!.GetValue<string>().Should().Be("<html>game</html>");
+        remaining.OfType<TraeToolUseEndBlock>().Should().ContainSingle();
     }
 }

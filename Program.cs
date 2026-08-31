@@ -370,7 +370,8 @@ app.MapPost("/v1/messages", async (HttpContext ctx) =>
     if (stream)
     {
         ctx.Response.ContentType = "text/event-stream";
-        await WriteAnthropicStream(ctx.Response.Body, upstream, model, ct);
+        bool hasTools = body["tools"] is JsonArray { Count: > 0 };
+        await WriteAnthropicStream(ctx.Response.Body, upstream, model, hasTools, ct);
         return Results.Empty;
     }
     return Results.Json(await CollectAnthropic(upstream, model, ct));
@@ -553,7 +554,11 @@ List<(string role, string text)> ConvertOpenAIMessages(JsonArray? arr)
 List<(string role, string text)> ConvertAnthropicMessages(JsonObject body)
 {
     var result = new List<(string, string)>();
-    string system = TraeToolProtocol.BuildSystemPrompt(body["system"], body["tools"] as JsonArray, body["tool_choice"]);
+    var tools = body["tools"] as JsonArray;
+    JsonNode? toolChoice = body["tool_choice"];
+    if (TraeToolProtocol.ShouldForceToolUse(body["messages"] as JsonArray, tools, toolChoice))
+        toolChoice = new JsonObject { ["type"] = "any" };
+    string system = TraeToolProtocol.BuildSystemPrompt(body["system"], tools, toolChoice);
     if (!string.IsNullOrEmpty(system)) result.Add(("system", system));
     foreach (var m in body["messages"]?.AsArray() ?? new JsonArray())
     {
@@ -769,7 +774,8 @@ async Task<JsonObject> CollectAnthropic(IAsyncEnumerable<TraeSseEvent> upstream,
     };
 }
 
-async Task WriteAnthropicStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstream, string model, CancellationToken ct)
+async Task WriteAnthropicStream(
+    Stream w, IAsyncEnumerable<TraeSseEvent> upstream, string model, bool showToolProgress, CancellationToken ct)
 {
     string msgId = $"msg_{Guid.NewGuid():N}";
     bool messageStarted = false;
@@ -803,12 +809,12 @@ async Task WriteAnthropicStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstrea
     bool blockOpen = false;
     string? blockType = null;
     int blockIndex = -1;
-    bool sawContent = false;
+    bool sawUpstreamContent = false;
     bool sawToolUse = false;
     int inputTokens = 0;
     int outputTokens = 0;
     string finishReason = "stop";
-    var toolParser = new TraeToolProtocol.StreamParser();
+    var toolParser = new TraeToolProtocol.StreamParser(streamToolCalls: true);
 
     async Task CloseBlock()
     {
@@ -824,7 +830,6 @@ async Task WriteAnthropicStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstrea
         {
             if (string.IsNullOrEmpty(textBlock.Text)) return;
             await StartMessage();
-            sawContent = true;
             if (blockType != "text")
             {
                 await CloseBlock();
@@ -847,7 +852,6 @@ async Task WriteAnthropicStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstrea
         {
             await StartMessage();
             await CloseBlock();
-            sawContent = true;
             sawToolUse = true;
             blockIndex++;
             await WriteEvent("content_block_start", new JsonObject
@@ -869,11 +873,46 @@ async Task WriteAnthropicStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstrea
             });
             await WriteEvent("content_block_stop", new JsonObject { ["type"] = "content_block_stop", ["index"] = blockIndex });
         }
+        else if (block is TraeToolUseStartBlock toolStart)
+        {
+            await StartMessage();
+            await CloseBlock();
+            sawToolUse = true;
+            blockIndex++;
+            blockOpen = true;
+            blockType = "tool_use";
+            await WriteEvent("content_block_start", new JsonObject
+            {
+                ["type"] = "content_block_start", ["index"] = blockIndex,
+                ["content_block"] = new JsonObject
+                {
+                    ["type"] = "tool_use", ["id"] = toolStart.Id,
+                    ["name"] = toolStart.Name, ["input"] = new JsonObject()
+                }
+            });
+        }
+        else if (block is TraeToolInputDeltaBlock toolDelta && blockType == "tool_use")
+        {
+            await WriteEvent("content_block_delta", new JsonObject
+            {
+                ["type"] = "content_block_delta", ["index"] = blockIndex,
+                ["delta"] = new JsonObject
+                {
+                    ["type"] = "input_json_delta", ["partial_json"] = toolDelta.PartialJson
+                }
+            });
+        }
+        else if (block is TraeToolUseEndBlock && blockType == "tool_use")
+        {
+            await CloseBlock();
+        }
     }
 
     try
     {
         await WriteEvent("ping", new JsonObject { ["type"] = "ping" });
+        if (showToolProgress)
+            await WriteBlock(new TraeTextBlock("正在分析请求并准备调用工具...\n\n"));
         await foreach (var ev in TraeStreamHeartbeat.ReadAsync(
             upstream,
             cancellationToken => new ValueTask(WriteEvent("ping", new JsonObject { ["type"] = "ping" })),
@@ -885,6 +924,7 @@ async Task WriteAnthropicStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstrea
                 string? text = (string?)j["response"];
                 if (!string.IsNullOrEmpty(text))
                 {
+                    sawUpstreamContent = true;
                     if (j["finish_reason"] is JsonValue outputReason &&
                         outputReason.TryGetValue<string>(out var parsedOutputReason))
                         finishReason = parsedOutputReason;
@@ -899,7 +939,7 @@ async Task WriteAnthropicStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstrea
             else if (ev.Event == "done")
             {
                 foreach (TraeOutputBlock block in toolParser.Complete()) await WriteBlock(block);
-                if (!sawContent) throw new TraeUpstreamException("Trae 上游完成但未返回有效内容。");
+                if (!sawUpstreamContent) throw new TraeUpstreamException("Trae 上游完成但未返回有效内容。");
                 if (j?["finish_reason"] is JsonValue doneReason &&
                     doneReason.TryGetValue<string>(out var parsedDoneReason))
                     finishReason = parsedDoneReason;
