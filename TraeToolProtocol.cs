@@ -16,10 +16,21 @@ public sealed record TraeToolInputDeltaBlock(string PartialJson) : TraeOutputBlo
 
 public sealed record TraeToolUseEndBlock : TraeOutputBlock;
 
+public sealed record TraeThinkingStartBlock : TraeOutputBlock;
+
+public sealed record TraeThinkingDeltaBlock(string Text) : TraeOutputBlock;
+
+public sealed record TraeThinkingEndBlock : TraeOutputBlock;
+
 public static class TraeToolProtocol
 {
     private const string OpenTag = "<tool_call>";
     private const string CloseTag = "</tool_call>";
+    private static readonly (string Open, string Close)[] ThinkingTags =
+    {
+        ("<thinking>", "</thinking>"),
+        ("<think>", "</think>")
+    };
     private static readonly Regex EnglishAction = new(
         @"\b(create|write|build|implement|modify|edit|fix|delete|rename|move|run|execute|install|test|inspect|search|read|open)\b",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
@@ -69,7 +80,7 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
         string text = ContentText(lastUser["content"]);
         bool chineseAction = ContainsAny(text, "创建", "新建", "生成", "写一个", "帮我写", "修改", "修复", "实现", "开发", "删除", "重命名", "移动", "运行", "执行", "安装", "测试", "检查", "搜索", "读取", "打开");
         bool chineseTarget = ContainsAny(text, "文件", "代码", "项目", "工作区", "应用", "页面", "网页", "脚本", "游戏", "网站", "组件", "接口", "命令", "H5", "h5");
-        return (chineseAction && chineseTarget) || (EnglishAction.IsMatch(text) && EnglishTarget.IsMatch(text));
+        return (chineseAction || EnglishAction.IsMatch(text)) && (chineseTarget || EnglishTarget.IsMatch(text));
     }
 
     private static bool IsExecutionTool(string name)
@@ -132,6 +143,8 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
         private readonly bool _streamToolCalls;
         private bool _inToolCall;
         private bool _toolCallStarted;
+        private bool _inThinking;
+        private string _thinkingCloseTag = "";
 
         public StreamParser(bool streamToolCalls = false)
         {
@@ -152,6 +165,37 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
             while (_buffer.Length > 0)
             {
                 string buffered = _buffer.ToString();
+                if (_inThinking)
+                {
+                    int thinkingCloseIndex = buffered.IndexOf(_thinkingCloseTag, StringComparison.Ordinal);
+                    if (thinkingCloseIndex < 0)
+                    {
+                        if (final)
+                        {
+                            if (buffered.Length > 0) blocks.Add(new TraeThinkingDeltaBlock(buffered));
+                            _buffer.Clear();
+                            blocks.Add(new TraeThinkingEndBlock());
+                            _inThinking = false;
+                            break;
+                        }
+
+                        int thinkingBoundaryLength = PartialTagLength(buffered, _thinkingCloseTag);
+                        int thinkingDeltaLength = buffered.Length - thinkingBoundaryLength;
+                        if (thinkingDeltaLength > 0)
+                        {
+                            blocks.Add(new TraeThinkingDeltaBlock(buffered[..thinkingDeltaLength]));
+                            _buffer.Remove(0, thinkingDeltaLength);
+                        }
+                        break;
+                    }
+
+                    if (thinkingCloseIndex > 0) blocks.Add(new TraeThinkingDeltaBlock(buffered[..thinkingCloseIndex]));
+                    _buffer.Remove(0, thinkingCloseIndex + _thinkingCloseTag.Length);
+                    blocks.Add(new TraeThinkingEndBlock());
+                    _inThinking = false;
+                    continue;
+                }
+
                 if (_inToolCall)
                 {
                     int closeIndex = buffered.IndexOf(CloseTag, StringComparison.Ordinal);
@@ -217,6 +261,28 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
                 }
 
                 int openIndex = buffered.IndexOf(OpenTag, StringComparison.Ordinal);
+                int thinkingIndex = -1;
+                string thinkingOpenTag = "";
+                string thinkingCloseTag = "";
+                foreach (var tag in ThinkingTags)
+                {
+                    int candidate = buffered.IndexOf(tag.Open, StringComparison.Ordinal);
+                    if (candidate < 0 || (thinkingIndex >= 0 && candidate >= thinkingIndex)) continue;
+                    thinkingIndex = candidate;
+                    thinkingOpenTag = tag.Open;
+                    thinkingCloseTag = tag.Close;
+                }
+
+                if (thinkingIndex >= 0 && (openIndex < 0 || thinkingIndex < openIndex))
+                {
+                    if (thinkingIndex > 0) blocks.Add(new TraeTextBlock(buffered[..thinkingIndex]));
+                    _buffer.Remove(0, thinkingIndex + thinkingOpenTag.Length);
+                    _inThinking = true;
+                    _thinkingCloseTag = thinkingCloseTag;
+                    blocks.Add(new TraeThinkingStartBlock());
+                    continue;
+                }
+
                 if (openIndex >= 0)
                 {
                     if (openIndex > 0) blocks.Add(new TraeTextBlock(buffered[..openIndex]));
@@ -313,20 +379,20 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
 
         private static int PartialOpenTagLength(string value)
         {
-            int maximum = Math.Min(value.Length, OpenTag.Length - 1);
-            for (int length = maximum; length > 0; length--)
-            {
-                if (OpenTag.StartsWith(value[^length..], StringComparison.Ordinal)) return length;
-            }
-            return 0;
+            int retained = PartialTagLength(value, OpenTag);
+            foreach (var tag in ThinkingTags)
+                retained = Math.Max(retained, PartialTagLength(value, tag.Open));
+            return retained;
         }
 
-        private static int PartialCloseTagLength(string value)
+        private static int PartialCloseTagLength(string value) => PartialTagLength(value, CloseTag);
+
+        private static int PartialTagLength(string value, string tag)
         {
-            int maximum = Math.Min(value.Length, CloseTag.Length - 1);
+            int maximum = Math.Min(value.Length, tag.Length - 1);
             for (int length = maximum; length > 0; length--)
             {
-                if (CloseTag.StartsWith(value[^length..], StringComparison.Ordinal)) return length;
+                if (tag.StartsWith(value[^length..], StringComparison.Ordinal)) return length;
             }
             return 0;
         }

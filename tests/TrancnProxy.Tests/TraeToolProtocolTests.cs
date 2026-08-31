@@ -124,4 +124,50 @@ public sealed class TraeToolProtocolTests
         JsonNode.Parse(streamedJson)!["content"]!.GetValue<string>().Should().Be("<html>game</html>");
         remaining.OfType<TraeToolUseEndBlock>().Should().ContainSingle();
     }
+
+    [TestMethod]
+    public void Parse_SeparatesThinkingFromVisibleText()
+    {
+        var blocks = TraeToolProtocol.Parse("<think>先规划赛道</think>开始实现。");
+
+        blocks.OfType<TraeThinkingStartBlock>().Should().ContainSingle();
+        string thinking = string.Concat(blocks.OfType<TraeThinkingDeltaBlock>().Select(block => block.Text));
+        thinking.Should().Be("先规划赛道");
+        blocks.OfType<TraeThinkingEndBlock>().Should().ContainSingle();
+        blocks.OfType<TraeTextBlock>().Single().Text.Should().Be("开始实现。");
+    }
+
+    [TestMethod]
+    public void StreamParser_StreamsThinkingAcrossChunks()
+    {
+        var parser = new TraeToolProtocol.StreamParser(streamToolCalls: true);
+        var blocks = new List<TraeOutputBlock>();
+
+        blocks.AddRange(parser.Push("<thin"));
+        blocks.AddRange(parser.Push("k>分析需求"));
+        blocks.AddRange(parser.Push("，选择方案</thi"));
+        blocks.AddRange(parser.Push("nk>正文"));
+        blocks.AddRange(parser.Complete());
+
+        string thinking = string.Concat(blocks.OfType<TraeThinkingDeltaBlock>().Select(block => block.Text));
+        thinking.Should().Be("分析需求，选择方案");
+        blocks.OfType<TraeThinkingEndBlock>().Should().ContainSingle();
+        string text = string.Concat(blocks.OfType<TraeTextBlock>().Select(block => block.Text));
+        text.Should().Be("正文");
+    }
+
+    [TestMethod]
+    public void StreamParser_SupportsThinkingTagVariantBeforeToolCall()
+    {
+        var parser = new TraeToolProtocol.StreamParser(streamToolCalls: true);
+        var blocks = new List<TraeOutputBlock>();
+
+        blocks.AddRange(parser.Push("<thinking>需要写文件</thinking>"));
+        blocks.AddRange(parser.Push("<tool_call>{\"name\":\"write_file\",\"arguments\":{\"path\":\"a.html\"}}</tool_call>"));
+        blocks.AddRange(parser.Complete());
+
+        string thinking = string.Concat(blocks.OfType<TraeThinkingDeltaBlock>().Select(block => block.Text));
+        thinking.Should().Be("需要写文件");
+        blocks.OfType<TraeToolUseStartBlock>().Should().ContainSingle().Which.Name.Should().Be("write_file");
+    }
 }

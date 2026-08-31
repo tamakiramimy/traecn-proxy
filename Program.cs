@@ -370,8 +370,7 @@ app.MapPost("/v1/messages", async (HttpContext ctx) =>
     if (stream)
     {
         ctx.Response.ContentType = "text/event-stream";
-        bool hasTools = body["tools"] is JsonArray { Count: > 0 };
-        await WriteAnthropicStream(ctx.Response.Body, upstream, model, hasTools, ct);
+        await WriteAnthropicStream(ctx.Response.Body, upstream, model, ct);
         return Results.Empty;
     }
     return Results.Json(await CollectAnthropic(upstream, model, ct));
@@ -746,9 +745,21 @@ async Task<JsonObject> CollectAnthropic(IAsyncEnumerable<TraeSseEvent> upstream,
     var result = await TraeChatResult.CollectAsync(upstream, ct);
     var content = new JsonArray();
     bool hasToolUse = false;
+    var thinking = new StringBuilder();
     foreach (TraeOutputBlock block in TraeToolProtocol.Parse(result.Text))
     {
-        if (block is TraeTextBlock textBlock && !string.IsNullOrWhiteSpace(textBlock.Text))
+        if (block is TraeThinkingDeltaBlock thinkingDelta)
+            thinking.Append(thinkingDelta.Text);
+        else if (block is TraeThinkingEndBlock)
+        {
+            if (thinking.Length > 0)
+                content.Add(new JsonObject
+                {
+                    ["type"] = "thinking", ["thinking"] = thinking.ToString()
+                });
+            thinking.Clear();
+        }
+        else if (block is TraeTextBlock textBlock && !string.IsNullOrWhiteSpace(textBlock.Text))
             content.Add(new JsonObject { ["type"] = "text", ["text"] = textBlock.Text });
         else if (block is TraeToolUseBlock toolUse)
         {
@@ -775,7 +786,7 @@ async Task<JsonObject> CollectAnthropic(IAsyncEnumerable<TraeSseEvent> upstream,
 }
 
 async Task WriteAnthropicStream(
-    Stream w, IAsyncEnumerable<TraeSseEvent> upstream, string model, bool showToolProgress, CancellationToken ct)
+    Stream w, IAsyncEnumerable<TraeSseEvent> upstream, string model, CancellationToken ct)
 {
     string msgId = $"msg_{Guid.NewGuid():N}";
     bool messageStarted = false;
@@ -906,13 +917,38 @@ async Task WriteAnthropicStream(
         {
             await CloseBlock();
         }
+        else if (block is TraeThinkingStartBlock)
+        {
+            await StartMessage();
+            await CloseBlock();
+            blockIndex++;
+            blockOpen = true;
+            blockType = "thinking";
+            await WriteEvent("content_block_start", new JsonObject
+            {
+                ["type"] = "content_block_start", ["index"] = blockIndex,
+                ["content_block"] = new JsonObject { ["type"] = "thinking", ["thinking"] = "" }
+            });
+        }
+        else if (block is TraeThinkingDeltaBlock thinkingDelta && blockType == "thinking")
+        {
+            if (string.IsNullOrEmpty(thinkingDelta.Text)) return;
+            await WriteEvent("content_block_delta", new JsonObject
+            {
+                ["type"] = "content_block_delta", ["index"] = blockIndex,
+                ["delta"] = new JsonObject { ["type"] = "thinking_delta", ["thinking"] = thinkingDelta.Text }
+            });
+        }
+        else if (block is TraeThinkingEndBlock && blockType == "thinking")
+        {
+            await CloseBlock();
+        }
     }
 
     try
     {
+        await StartMessage();
         await WriteEvent("ping", new JsonObject { ["type"] = "ping" });
-        if (showToolProgress)
-            await WriteBlock(new TraeTextBlock("正在分析请求并准备调用工具...\n\n"));
         await foreach (var ev in TraeStreamHeartbeat.ReadAsync(
             upstream,
             cancellationToken => new ValueTask(WriteEvent("ping", new JsonObject { ["type"] = "ping" })),
