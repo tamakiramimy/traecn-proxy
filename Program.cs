@@ -643,6 +643,7 @@ async Task WriteOpenAIStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstream, 
 
     try
     {
+        await SendRaw(": keep-alive\n\n", ct);
         await foreach (var ev in TraeStreamHeartbeat.ReadAsync(
             upstream,
             cancellationToken => SendRaw(": keep-alive\n\n", cancellationToken),
@@ -788,6 +789,7 @@ async Task WriteAnthropicStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstrea
     string finishReason = "stop";
     try
     {
+        await WriteEvent("ping", new JsonObject { ["type"] = "ping" });
         await foreach (var ev in TraeStreamHeartbeat.ReadAsync(
             upstream,
             cancellationToken => new ValueTask(WriteEvent("ping", new JsonObject { ["type"] = "ping" })),
@@ -984,6 +986,7 @@ async Task WriteResponsesStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstrea
     bool sawContent = false;
     try
     {
+        await WriteRaw(": keep-alive\n\n", ct);
         await foreach (var ev in TraeStreamHeartbeat.ReadAsync(
             upstream,
             cancellationToken => WriteRaw(": keep-alive\n\n", cancellationToken),

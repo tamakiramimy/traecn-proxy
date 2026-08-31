@@ -113,6 +113,25 @@ public sealed class TraeReliabilityTests
         values.Should().Equal(42);
     }
 
+    [TestMethod]
+    public async Task StreamHeartbeat_IsNotResetByIgnoredUpstreamEvents()
+    {
+        int heartbeatCount = 0;
+
+        await foreach (int _ in TraeStreamHeartbeat.ReadAsync(
+            BusyValues(),
+            _ =>
+            {
+                Interlocked.Increment(ref heartbeatCount);
+                return ValueTask.CompletedTask;
+            },
+            TimeSpan.FromMilliseconds(15)))
+        {
+        }
+
+        heartbeatCount.Should().BeGreaterThanOrEqualTo(2);
+    }
+
     private static TraeClient CreateClient(HttpMessageHandler handler) => new(
         new TraeAuthData { Token = "test-token", ApiHost = "https://upstream.example" },
         httpMessageHandler: handler);
@@ -131,6 +150,16 @@ public sealed class TraeReliabilityTests
         yield return 42;
     }
 
+    private static async IAsyncEnumerable<int> BusyValues(
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        for (int index = 0; index < 20; index++)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(3), cancellationToken);
+            yield return index;
+        }
+    }
+
     private sealed class StaticResponseHandler(string responseBody) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(
@@ -140,4 +169,5 @@ public sealed class TraeReliabilityTests
             Content = new StringContent(responseBody, Encoding.UTF8, "text/event-stream")
         });
     }
+
 }

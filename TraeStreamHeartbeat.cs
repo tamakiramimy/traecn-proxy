@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 
 namespace TrancnProxy;
@@ -20,10 +21,15 @@ public static class TraeStreamHeartbeat
 
         await using var enumerator = source.GetAsyncEnumerator(cancellationToken);
         Task<bool> moveNext = enumerator.MoveNextAsync().AsTask();
+        long lastHeartbeat = Stopwatch.GetTimestamp();
         while (true)
         {
+            TimeSpan elapsed = Stopwatch.GetElapsedTime(lastHeartbeat);
+            TimeSpan delayUntilHeartbeat = elapsed < heartbeatInterval
+                ? heartbeatInterval - elapsed
+                : TimeSpan.Zero;
             using var delayCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            Task delay = Task.Delay(heartbeatInterval, delayCancellation.Token);
+            Task delay = Task.Delay(delayUntilHeartbeat, delayCancellation.Token);
             Task completed = await Task.WhenAny(moveNext, delay);
             if (completed == moveNext)
             {
@@ -36,6 +42,7 @@ public static class TraeStreamHeartbeat
 
             cancellationToken.ThrowIfCancellationRequested();
             await writeHeartbeat(cancellationToken);
+            lastHeartbeat = Stopwatch.GetTimestamp();
         }
     }
 }
