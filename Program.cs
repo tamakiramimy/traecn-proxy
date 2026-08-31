@@ -220,6 +220,15 @@ app.Use(async (ctx, next) =>
             error = new { message = ex.Message, type = "upstream_error", code = "ide_bridge_error" }
         });
     }
+    catch (Exception ex) when (ex is TraeUpstreamException or TraeIncompleteStreamException && !ctx.Response.HasStarted)
+    {
+        ctx.Response.Clear();
+        ctx.Response.StatusCode = StatusCodes.Status502BadGateway;
+        await ctx.Response.WriteAsJsonAsync(new
+        {
+            error = new { message = ex.Message, type = "upstream_error", code = "upstream_incomplete_response" }
+        });
+    }
 });
 
 app.Use(async (ctx, next) =>
@@ -382,7 +391,12 @@ app.MapGet("/admin/api/accounts", () => Results.Json(new
         last_success_at = x.LastSuccessAt,
         last_error = x.LastError
     }),
-    settings = new { load_balancing = accountManager.Settings.LoadBalancing, session_ttl_minutes = accountManager.Settings.SessionTtlMinutes }
+    settings = new
+    {
+        load_balancing = accountManager.Settings.LoadBalancing,
+        session_ttl_minutes = accountManager.Settings.SessionTtlMinutes,
+        default_max_concurrency = accountManager.Settings.DefaultMaxConcurrency
+    }
 }));
 
 app.MapPost("/admin/api/accounts/import", async (HttpContext ctx) =>
@@ -403,6 +417,16 @@ app.MapDelete("/admin/api/accounts/{alias}", (string alias) =>
     accountManager.Remove(alias) ? Results.NoContent() : Results.NotFound());
 app.MapPost("/admin/api/accounts/{alias}/priority/{priority:int}", (string alias, int priority) =>
     accountManager.SetPriority(alias, priority) ? Results.Ok(new { ok = true }) : Results.NotFound());
+app.MapPost("/admin/api/accounts/{alias}/max-concurrency/{maxConcurrency:int}", (string alias, int maxConcurrency) =>
+{
+    try
+    {
+        return accountManager.SetMaxConcurrency(alias, maxConcurrency)
+            ? Results.Ok(new { ok = true })
+            : Results.NotFound();
+    }
+    catch (InvalidOperationException ex) { return Results.BadRequest(new { error = ex.Message }); }
+});
 app.MapPost("/admin/api/accounts/{alias}/refresh", async (string alias, CancellationToken ct) =>
 {
     try { return await accountManager.RefreshAsync(alias, ct) ? Results.Ok(new { ok = true }) : Results.BadRequest(new { error = "refresh failed" }); }
@@ -423,7 +447,8 @@ app.MapPut("/admin/api/settings", async (HttpContext ctx) =>
     {
         var body = JsonNode.Parse(await new StreamReader(ctx.Request.Body).ReadToEndAsync(ctx.RequestAborted))?.AsObject();
         accountManager.UpdateSettings((string?)body?["load_balancing"] ?? accountManager.Settings.LoadBalancing,
-            (int?)body?["session_ttl_minutes"] ?? accountManager.Settings.SessionTtlMinutes);
+            (int?)body?["session_ttl_minutes"] ?? accountManager.Settings.SessionTtlMinutes,
+            (int?)body?["default_max_concurrency"] ?? accountManager.Settings.DefaultMaxConcurrency);
         return Results.Ok(new { ok = true });
     }
     catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
@@ -434,10 +459,11 @@ app.MapPost("/admin/api/accounts/login/start", async (HttpContext ctx) =>
     {
         var body = JsonNode.Parse(await new StreamReader(ctx.Request.Body).ReadToEndAsync(ctx.RequestAborted))?.AsObject();
         string alias = (string?)body?["alias"] ?? "";
+        int maxConcurrency = (int?)body?["max_concurrency"] ?? accountManager.Settings.DefaultMaxConcurrency;
         var (deviceId, machineId) = TraeAuthStore.ReadDeviceIds();
         string baseUrl = publicBaseUrl ?? $"http://{(listen is "0.0.0.0" or "::" ? "127.0.0.1" : listen)}:{port}";
         string callbackUrl = baseUrl.TrimEnd('/') + "/admin/oauth/callback";
-        return Results.Ok(new { authorization_url = oauthLogins.Begin(alias, callbackUrl, deviceId, machineId) });
+        return Results.Ok(new { authorization_url = oauthLogins.Begin(alias, callbackUrl, deviceId, machineId, maxConcurrency) });
     }
     catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
 });
@@ -574,28 +600,7 @@ IResult UnsupportedModel(string model) => Results.BadRequest(new
 
 async Task<JsonObject> CollectOpenAI(IAsyncEnumerable<TraeSseEvent> upstream, string model, CancellationToken ct)
 {
-    var content = new StringBuilder();
-    int promptTokens = 0, completionTokens = 0, totalTokens = 0;
-    string finishReason = "stop";
-    await foreach (var ev in upstream)
-    {
-        var j = JsonNode.Parse(ev.Data) as JsonObject;
-        if (ev.Event == "output" && j != null)
-        {
-            content.Append((string?)j["response"] ?? "");
-            if (j["finish_reason"] is JsonValue fr && fr.TryGetValue<string>(out var f)) finishReason = f;
-        }
-        else if (ev.Event == "token_usage" && j != null)
-        {
-            promptTokens = (int?)j["prompt_tokens"] ?? promptTokens;
-            completionTokens = (int?)j["completion_tokens"] ?? completionTokens;
-            totalTokens = (int?)j["total_tokens"] ?? totalTokens;
-        }
-        else if (ev.Event == "done" && j?["finish_reason"] is JsonValue dfr && dfr.TryGetValue<string>(out var df))
-            finishReason = df;
-    }
-    if (content.Length == 0) content.Append("(上游返回空内容)");
-    if (totalTokens == 0) { completionTokens = Math.Max(1, content.Length / 4); totalTokens = promptTokens + completionTokens; }
+    var result = await TraeChatResult.CollectAsync(upstream, ct);
     return new JsonObject
     {
         ["id"] = $"chatcmpl-{Guid.NewGuid():N}",
@@ -605,14 +610,14 @@ async Task<JsonObject> CollectOpenAI(IAsyncEnumerable<TraeSseEvent> upstream, st
         ["choices"] = new JsonArray(new JsonObject
         {
             ["index"] = 0,
-            ["message"] = new JsonObject { ["role"] = "assistant", ["content"] = content.ToString() },
-            ["finish_reason"] = finishReason
+            ["message"] = new JsonObject { ["role"] = "assistant", ["content"] = result.Text },
+            ["finish_reason"] = OpenAiFinishReason(result.FinishReason)
         }),
         ["usage"] = new JsonObject
         {
-            ["prompt_tokens"] = promptTokens,
-            ["completion_tokens"] = completionTokens,
-            ["total_tokens"] = totalTokens
+            ["prompt_tokens"] = result.PromptTokens,
+            ["completion_tokens"] = result.CompletionTokens,
+            ["total_tokens"] = result.TotalTokens
         }
     };
 }
@@ -622,24 +627,72 @@ async Task WriteOpenAIStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstream, 
     string id = $"chatcmpl-{Guid.NewGuid():N}";
     int promptTokens = 0, completionTokens = 0, totalTokens = 0;
     bool sawContent = false;
+    bool wroteAnything = false;
+    string finishReason = "stop";
 
-    static async Task Send(Stream w, string data, CancellationToken ct)
+    async ValueTask SendRaw(string data, CancellationToken cancellationToken)
     {
-        var bytes = Encoding.UTF8.GetBytes($"data: {data}\n\n");
-        await w.WriteAsync(bytes, ct);
-        await w.FlushAsync(ct);
+        var bytes = Encoding.UTF8.GetBytes(data);
+        await w.WriteAsync(bytes, cancellationToken);
+        await w.FlushAsync(cancellationToken);
+        wroteAnything = true;
     }
 
-    await foreach (var ev in upstream)
+    ValueTask SendData(string data, CancellationToken cancellationToken) =>
+        SendRaw($"data: {data}\n\n", cancellationToken);
+
+    try
     {
-        var j = JsonNode.Parse(ev.Data) as JsonObject;
-        if (ev.Event == "output" && j != null)
+        await foreach (var ev in TraeStreamHeartbeat.ReadAsync(
+            upstream,
+            cancellationToken => SendRaw(": keep-alive\n\n", cancellationToken),
+            cancellationToken: ct))
         {
-            string? text = (string?)j["response"];
-            if (!string.IsNullOrEmpty(text))
+            var j = JsonNode.Parse(ev.Data) as JsonObject;
+            if (ev.Event == "output" && j != null)
             {
-                sawContent = true;
-                await Send(w, new JsonObject
+                string? text = (string?)j["response"];
+                if (!string.IsNullOrEmpty(text))
+                {
+                    bool firstContent = !sawContent;
+                    sawContent = true;
+                    if (j["finish_reason"] is JsonValue outputReason &&
+                        outputReason.TryGetValue<string>(out var parsedOutputReason))
+                        finishReason = parsedOutputReason;
+                    await SendData(new JsonObject
+                    {
+                        ["id"] = id,
+                        ["object"] = "chat.completion.chunk",
+                        ["created"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                        ["model"] = model,
+                        ["choices"] = new JsonArray(new JsonObject
+                        {
+                            ["index"] = 0,
+                            ["delta"] = new JsonObject
+                            {
+                                ["role"] = firstContent ? "assistant" : null,
+                                ["content"] = text
+                            },
+                            ["finish_reason"] = (JsonNode?)null
+                        })
+                    }.ToJsonString(), ct);
+                }
+            }
+            else if (ev.Event == "token_usage" && j != null)
+            {
+                promptTokens = (int?)j["prompt_tokens"] ?? promptTokens;
+                completionTokens = (int?)j["completion_tokens"] ?? completionTokens;
+                totalTokens = (int?)j["total_tokens"] ?? totalTokens;
+            }
+            else if (ev.Event == "done")
+            {
+                if (!sawContent) throw new TraeUpstreamException("Trae 上游完成但未返回有效内容。");
+                if (j?["finish_reason"] is JsonValue doneReason &&
+                    doneReason.TryGetValue<string>(out var parsedDoneReason))
+                    finishReason = parsedDoneReason;
+                if (totalTokens == 0 && (promptTokens > 0 || completionTokens > 0))
+                    totalTokens = promptTokens + completionTokens;
+                await SendData(new JsonObject
                 {
                     ["id"] = id,
                     ["object"] = "chat.completion.chunk",
@@ -648,89 +701,53 @@ async Task WriteOpenAIStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstream, 
                     ["choices"] = new JsonArray(new JsonObject
                     {
                         ["index"] = 0,
-                        ["delta"] = new JsonObject { ["content"] = text },
-                        ["finish_reason"] = (JsonNode?)null
-                    })
+                        ["delta"] = new JsonObject(),
+                        ["finish_reason"] = OpenAiFinishReason(finishReason)
+                    }),
+                    ["usage"] = new JsonObject
+                    {
+                        ["prompt_tokens"] = promptTokens,
+                        ["completion_tokens"] = completionTokens,
+                        ["total_tokens"] = totalTokens
+                    }
                 }.ToJsonString(), ct);
+                await SendData("[DONE]", ct);
+                return;
             }
         }
-        else if (ev.Event == "token_usage" && j != null)
-        {
-            promptTokens = (int?)j["prompt_tokens"] ?? promptTokens;
-            completionTokens = (int?)j["completion_tokens"] ?? completionTokens;
-            totalTokens = (int?)j["total_tokens"] ?? totalTokens;
-        }
-        else if (ev.Event == "done")
-        {
-            if (!sawContent)
-                await Send(w, new JsonObject
-                {
-                    ["id"] = id,
-                    ["object"] = "chat.completion.chunk",
-                    ["created"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                    ["model"] = model,
-                    ["choices"] = new JsonArray(new JsonObject
-                    {
-                        ["index"] = 0,
-                        ["delta"] = new JsonObject { ["content"] = "(上游返回空内容)" },
-                        ["finish_reason"] = (JsonNode?)null
-                    })
-                }.ToJsonString(), ct);
-            await Send(w, new JsonObject
-            {
-                ["id"] = id,
-                ["object"] = "chat.completion.chunk",
-                ["created"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                ["model"] = model,
-                ["choices"] = new JsonArray(new JsonObject
-                {
-                    ["index"] = 0,
-                    ["delta"] = new JsonObject(),
-                    ["finish_reason"] = "stop"
-                }),
-                ["usage"] = totalTokens > 0 ? new JsonObject
-                {
-                    ["prompt_tokens"] = promptTokens,
-                    ["completion_tokens"] = completionTokens,
-                    ["total_tokens"] = totalTokens
-                } : null
-            }.ToJsonString(), ct);
-            await Send(w, "[DONE]", ct);
-            return;
-        }
+        throw new TraeIncompleteStreamException();
     }
-    await Send(w, "[DONE]", ct);
+    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+    {
+        throw;
+    }
+    catch (Exception) when (wroteAnything)
+    {
+        await SendData(new JsonObject
+        {
+            ["error"] = new JsonObject
+            {
+                ["message"] = "Upstream stream failed before completion.",
+                ["type"] = "upstream_error",
+                ["code"] = "upstream_incomplete_response"
+            }
+        }.ToJsonString(), ct);
+    }
 }
 
 async Task<JsonObject> CollectAnthropic(IAsyncEnumerable<TraeSseEvent> upstream, string model, CancellationToken ct)
 {
-    var text = new StringBuilder();
-    int input = 0, output = 0;
-    await foreach (var ev in upstream)
-    {
-        var j = JsonNode.Parse(ev.Data) as JsonObject;
-        if (ev.Event == "output" && j != null)
-        {
-            text.Append((string?)j["response"] ?? "");
-        }
-        else if (ev.Event == "token_usage" && j != null)
-        {
-            input = (int?)j["prompt_tokens"] ?? input;
-            output = (int?)j["completion_tokens"] ?? output;
-        }
-    }
-    if (text.Length == 0) text.Append("(上游返回空内容)");
-    if (output == 0) output = Math.Max(1, text.Length / 4);
+    var result = await TraeChatResult.CollectAsync(upstream, ct);
     return new JsonObject
     {
         ["id"] = $"msg_{Guid.NewGuid():N}",
         ["type"] = "message",
         ["role"] = "assistant",
-        ["content"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = text.ToString() }),
+        ["content"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = result.Text }),
         ["model"] = model,
-        ["stop_reason"] = "end_turn",
+        ["stop_reason"] = AnthropicStopReason(result.FinishReason),
         ["stop_sequence"] = null,
-        ["usage"] = new JsonObject { ["input_tokens"] = input, ["output_tokens"] = output }
+        ["usage"] = new JsonObject { ["input_tokens"] = result.PromptTokens, ["output_tokens"] = result.CompletionTokens }
     };
 }
 
@@ -738,12 +755,14 @@ async Task WriteAnthropicStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstrea
 {
     string msgId = $"msg_{Guid.NewGuid():N}";
     bool messageStarted = false;
+    bool wroteAnything = false;
 
     async Task WriteEvent(string ev, JsonNode data)
     {
         var bytes = Encoding.UTF8.GetBytes($"event: {ev}\ndata: {data.ToJsonString()}\n\n");
         await w.WriteAsync(bytes, ct);
         await w.FlushAsync(ct);
+        wroteAnything = true;
     }
 
     async Task StartMessage()
@@ -764,51 +783,81 @@ async Task WriteAnthropicStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstrea
     }
 
     bool blockOpen = false;
-    int output = 0;
-    await foreach (var ev in upstream)
+    int inputTokens = 0;
+    int outputTokens = 0;
+    string finishReason = "stop";
+    try
     {
-        var j = JsonNode.Parse(ev.Data) as JsonObject;
-        if (ev.Event == "metadata")
+        await foreach (var ev in TraeStreamHeartbeat.ReadAsync(
+            upstream,
+            cancellationToken => new ValueTask(WriteEvent("ping", new JsonObject { ["type"] = "ping" })),
+            cancellationToken: ct))
         {
-            await StartMessage();
-        }
-        else if (ev.Event == "output" && j != null)
-        {
-            await StartMessage();
-            string? text = (string?)j["response"];
-            if (!string.IsNullOrEmpty(text))
+            var j = JsonNode.Parse(ev.Data) as JsonObject;
+            if (ev.Event == "output" && j != null)
             {
-                if (!blockOpen)
+                string? text = (string?)j["response"];
+                if (!string.IsNullOrEmpty(text))
                 {
-                    blockOpen = true;
-                    await WriteEvent("content_block_start", new JsonObject
+                    await StartMessage();
+                    if (!blockOpen)
                     {
-                        ["type"] = "content_block_start", ["index"] = 0,
-                        ["content_block"] = new JsonObject { ["type"] = "text", ["text"] = "" }
+                        blockOpen = true;
+                        await WriteEvent("content_block_start", new JsonObject
+                        {
+                            ["type"] = "content_block_start", ["index"] = 0,
+                            ["content_block"] = new JsonObject { ["type"] = "text", ["text"] = "" }
+                        });
+                    }
+                    if (j["finish_reason"] is JsonValue outputReason &&
+                        outputReason.TryGetValue<string>(out var parsedOutputReason))
+                        finishReason = parsedOutputReason;
+                    await WriteEvent("content_block_delta", new JsonObject
+                    {
+                        ["type"] = "content_block_delta", ["index"] = 0,
+                        ["delta"] = new JsonObject { ["type"] = "text_delta", ["text"] = text }
                     });
                 }
-                output += text.Length;
-                await WriteEvent("content_block_delta", new JsonObject
+            }
+            else if (ev.Event == "token_usage" && j != null)
+            {
+                inputTokens = (int?)j["prompt_tokens"] ?? inputTokens;
+                outputTokens = (int?)j["completion_tokens"] ?? outputTokens;
+            }
+            else if (ev.Event == "done")
+            {
+                if (!blockOpen) throw new TraeUpstreamException("Trae 上游完成但未返回有效内容。");
+                if (j?["finish_reason"] is JsonValue doneReason &&
+                    doneReason.TryGetValue<string>(out var parsedDoneReason))
+                    finishReason = parsedDoneReason;
+                await WriteEvent("content_block_stop", new JsonObject { ["type"] = "content_block_stop", ["index"] = 0 });
+                await WriteEvent("message_delta", new JsonObject
                 {
-                    ["type"] = "content_block_delta", ["index"] = 0,
-                    ["delta"] = new JsonObject { ["type"] = "text_delta", ["text"] = text }
+                    ["type"] = "message_delta",
+                    ["delta"] = new JsonObject { ["stop_reason"] = AnthropicStopReason(finishReason), ["stop_sequence"] = null },
+                    ["usage"] = new JsonObject { ["output_tokens"] = outputTokens }
                 });
+                await WriteEvent("message_stop", new JsonObject { ["type"] = "message_stop" });
+                return;
             }
         }
-        else if (ev.Event == "done")
+        throw new TraeIncompleteStreamException();
+    }
+    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+    {
+        throw;
+    }
+    catch (Exception) when (wroteAnything)
+    {
+        await WriteEvent("error", new JsonObject
         {
-            await StartMessage();
-            if (blockOpen)
-                await WriteEvent("content_block_stop", new JsonObject { ["type"] = "content_block_stop", ["index"] = 0 });
-            await WriteEvent("message_delta", new JsonObject
+            ["type"] = "error",
+            ["error"] = new JsonObject
             {
-                ["type"] = "message_delta",
-                ["delta"] = new JsonObject { ["stop_reason"] = "end_turn", ["stop_sequence"] = null },
-                ["usage"] = new JsonObject { ["output_tokens"] = Math.Max(1, output / 4) }
-            });
-            await WriteEvent("message_stop", new JsonObject { ["type"] = "message_stop" });
-            return;
-        }
+                ["type"] = "upstream_error",
+                ["message"] = "Upstream stream failed before completion."
+            }
+        });
     }
 }
 
@@ -833,22 +882,7 @@ List<(string role, string text)> ConvertResponsesInput(JsonNode? input) => input
 
 async Task<JsonObject> CollectResponses(IAsyncEnumerable<TraeSseEvent> upstream, string model, string respId, CancellationToken ct)
 {
-    var text = new StringBuilder();
-    int promptTokens = 0, completionTokens = 0, totalTokens = 0;
-    await foreach (var ev in upstream)
-    {
-        var j = JsonNode.Parse(ev.Data) as JsonObject;
-        if (ev.Event == "output" && j != null)
-            text.Append((string?)j["response"] ?? "");
-        else if (ev.Event == "token_usage" && j != null)
-        {
-            promptTokens = (int?)j["prompt_tokens"] ?? promptTokens;
-            completionTokens = (int?)j["completion_tokens"] ?? completionTokens;
-            totalTokens = (int?)j["total_tokens"] ?? totalTokens;
-        }
-    }
-    if (text.Length == 0) text.Append("(上游返回空内容)");
-    if (totalTokens == 0) { completionTokens = Math.Max(1, text.Length / 4); totalTokens = promptTokens + completionTokens; }
+    var result = await TraeChatResult.CollectAsync(upstream, ct);
     string msgId = $"msg_{Guid.NewGuid():N}";
     return new JsonObject
     {
@@ -866,28 +900,53 @@ async Task<JsonObject> CollectResponses(IAsyncEnumerable<TraeSseEvent> upstream,
             ["content"] = new JsonArray(new JsonObject
             {
                 ["type"] = "output_text",
-                ["text"] = text.ToString(),
+                ["text"] = result.Text,
                 ["annotations"] = new JsonArray()
             })
         }),
         ["usage"] = new JsonObject
         {
-            ["input_tokens"] = promptTokens,
-            ["output_tokens"] = completionTokens,
-            ["total_tokens"] = totalTokens
+            ["input_tokens"] = result.PromptTokens,
+            ["output_tokens"] = result.CompletionTokens,
+            ["total_tokens"] = result.TotalTokens
         }
     };
 }
 
+string OpenAiFinishReason(string reason) => reason switch
+{
+    "max_tokens" or "length" => "length",
+    "content_filter" => "content_filter",
+    "tool_use" or "tool_calls" => "tool_calls",
+    _ => "stop"
+};
+
+string AnthropicStopReason(string reason) => reason switch
+{
+    "max_tokens" or "length" => "max_tokens",
+    "tool_use" or "tool_calls" => "tool_use",
+    _ => "end_turn"
+};
+
 async Task WriteResponsesStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstream, string model, string respId, CancellationToken ct)
 {
     string msgId = $"msg_{Guid.NewGuid():N}";
+    int sequenceNumber = 0;
+    bool wroteAnything = false;
+
+    async ValueTask WriteRaw(string value, CancellationToken cancellationToken)
+    {
+        var bytes = Encoding.UTF8.GetBytes(value);
+        await w.WriteAsync(bytes, cancellationToken);
+        await w.FlushAsync(cancellationToken);
+        wroteAnything = true;
+    }
 
     async Task WriteEvent(string ev, JsonNode data)
     {
-        var bytes = Encoding.UTF8.GetBytes($"event: {ev}\ndata: {data.ToJsonString()}\n\n");
-        await w.WriteAsync(bytes, ct);
-        await w.FlushAsync(ct);
+        if (data is JsonObject payload && !payload.ContainsKey("sequence_number"))
+            payload["sequence_number"] = sequenceNumber++;
+        await WriteRaw($"event: {ev}\ndata: {data.ToJsonString()}\n\n", ct);
     }
 
     var baseResponse = new JsonObject
@@ -923,87 +982,99 @@ async Task WriteResponsesStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstrea
     var text = new StringBuilder();
     int promptTokens = 0, completionTokens = 0, totalTokens = 0;
     bool sawContent = false;
-    await foreach (var ev in upstream)
+    try
     {
-        var j = JsonNode.Parse(ev.Data) as JsonObject;
-        if (ev.Event == "metadata")
+        await foreach (var ev in TraeStreamHeartbeat.ReadAsync(
+            upstream,
+            cancellationToken => WriteRaw(": keep-alive\n\n", cancellationToken),
+            cancellationToken: ct))
         {
-            await StartResponse();
-        }
-        else if (ev.Event == "output" && j != null)
-        {
-            await StartResponse();
-            string? t = (string?)j["response"];
-            if (!string.IsNullOrEmpty(t))
+            var j = JsonNode.Parse(ev.Data) as JsonObject;
+            if (ev.Event == "output" && j != null)
             {
-                sawContent = true;
-                text.Append(t);
-                await WriteEvent("response.output_text.delta", new JsonObject
+                string? t = (string?)j["response"];
+                if (!string.IsNullOrEmpty(t))
                 {
-                    ["type"] = "response.output_text.delta",
-                    ["item_id"] = msgId, ["output_index"] = 0, ["content_index"] = 0,
-                    ["delta"] = t
-                });
+                    await StartResponse();
+                    sawContent = true;
+                    text.Append(t);
+                    await WriteEvent("response.output_text.delta", new JsonObject
+                    {
+                        ["type"] = "response.output_text.delta",
+                        ["item_id"] = msgId, ["output_index"] = 0, ["content_index"] = 0,
+                        ["delta"] = t
+                    });
+                }
             }
-        }
-        else if (ev.Event == "token_usage" && j != null)
-        {
-            promptTokens = (int?)j["prompt_tokens"] ?? promptTokens;
-            completionTokens = (int?)j["completion_tokens"] ?? completionTokens;
-            totalTokens = (int?)j["total_tokens"] ?? totalTokens;
-        }
-        else if (ev.Event == "done")
-        {
-            await StartResponse();
-            if (!sawContent)
+            else if (ev.Event == "token_usage" && j != null)
             {
-                sawContent = true;
-                text.Append("(上游返回空内容)");
-                await WriteEvent("response.output_text.delta", new JsonObject
+                promptTokens = (int?)j["prompt_tokens"] ?? promptTokens;
+                completionTokens = (int?)j["completion_tokens"] ?? completionTokens;
+                totalTokens = (int?)j["total_tokens"] ?? totalTokens;
+            }
+            else if (ev.Event == "done")
+            {
+                if (!sawContent) throw new TraeUpstreamException("Trae 上游完成但未返回有效内容。");
+                if (totalTokens == 0 && (promptTokens > 0 || completionTokens > 0))
+                    totalTokens = promptTokens + completionTokens;
+                await WriteEvent("response.output_text.done", new JsonObject
                 {
-                    ["type"] = "response.output_text.delta",
+                    ["type"] = "response.output_text.done",
                     ["item_id"] = msgId, ["output_index"] = 0, ["content_index"] = 0,
-                    ["delta"] = "(上游返回空内容)"
+                    ["text"] = text.ToString()
                 });
-            }
-            if (totalTokens == 0) { completionTokens = Math.Max(1, text.Length / 4); totalTokens = promptTokens + completionTokens; }
-            await WriteEvent("response.output_text.done", new JsonObject
-            {
-                ["type"] = "response.output_text.done",
-                ["item_id"] = msgId, ["output_index"] = 0, ["content_index"] = 0,
-                ["text"] = text.ToString()
-            });
-            await WriteEvent("response.content_part.done", new JsonObject
-            {
-                ["type"] = "response.content_part.done",
-                ["item_id"] = msgId, ["output_index"] = 0, ["content_index"] = 0,
-                ["part"] = new JsonObject { ["type"] = "output_text", ["text"] = text.ToString(), ["annotations"] = new JsonArray() }
-            });
-            await WriteEvent("response.output_item.done", new JsonObject
-            {
-                ["type"] = "response.output_item.done",
-                ["output_index"] = 0,
-                ["item"] = new JsonObject
+                await WriteEvent("response.content_part.done", new JsonObject
+                {
+                    ["type"] = "response.content_part.done",
+                    ["item_id"] = msgId, ["output_index"] = 0, ["content_index"] = 0,
+                    ["part"] = new JsonObject { ["type"] = "output_text", ["text"] = text.ToString(), ["annotations"] = new JsonArray() }
+                });
+                await WriteEvent("response.output_item.done", new JsonObject
+                {
+                    ["type"] = "response.output_item.done",
+                    ["output_index"] = 0,
+                    ["item"] = new JsonObject
+                    {
+                        ["id"] = msgId, ["type"] = "message", ["status"] = "completed", ["role"] = "assistant",
+                        ["content"] = new JsonArray(new JsonObject { ["type"] = "output_text", ["text"] = text.ToString(), ["annotations"] = new JsonArray() })
+                    }
+                });
+                var completed = baseResponse.DeepClone()!.AsObject();
+                completed["status"] = "completed";
+                completed["output"] = new JsonArray(new JsonObject
                 {
                     ["id"] = msgId, ["type"] = "message", ["status"] = "completed", ["role"] = "assistant",
                     ["content"] = new JsonArray(new JsonObject { ["type"] = "output_text", ["text"] = text.ToString(), ["annotations"] = new JsonArray() })
-                }
-            });
-            var completed = baseResponse.DeepClone()!.AsObject();
-            completed["status"] = "completed";
-            completed["output"] = new JsonArray(new JsonObject
-            {
-                ["id"] = msgId, ["type"] = "message", ["status"] = "completed", ["role"] = "assistant",
-                ["content"] = new JsonArray(new JsonObject { ["type"] = "output_text", ["text"] = text.ToString(), ["annotations"] = new JsonArray() })
-            });
-            completed["usage"] = new JsonObject
-            {
-                ["input_tokens"] = promptTokens,
-                ["output_tokens"] = completionTokens,
-                ["total_tokens"] = totalTokens
-            };
-            await WriteEvent("response.completed", new JsonObject { ["type"] = "response.completed", ["response"] = completed });
-            return;
+                });
+                completed["usage"] = new JsonObject
+                {
+                    ["input_tokens"] = promptTokens,
+                    ["output_tokens"] = completionTokens,
+                    ["total_tokens"] = totalTokens
+                };
+                await WriteEvent("response.completed", new JsonObject { ["type"] = "response.completed", ["response"] = completed });
+                return;
+            }
         }
+        throw new TraeIncompleteStreamException();
+    }
+    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+    {
+        throw;
+    }
+    catch (Exception) when (wroteAnything)
+    {
+        var failed = baseResponse.DeepClone()!.AsObject();
+        failed["status"] = "failed";
+        failed["error"] = new JsonObject
+        {
+            ["code"] = "upstream_incomplete_response",
+            ["message"] = "Upstream stream failed before completion."
+        };
+        await WriteEvent("response.failed", new JsonObject
+        {
+            ["type"] = "response.failed",
+            ["response"] = failed
+        });
     }
 }

@@ -85,7 +85,7 @@ public sealed class TraeAgentClientTests
     [TestMethod]
     public async Task ChatStreamAsync_UsesConfiguredChatApiHost()
     {
-        var handler = new RecordingHandler("event: metadata\ndata: {\"model\":\"glm-5.3__dev\"}\n\nevent: output\ndata: {\"response\":\"ok\"}\n\n");
+        var handler = new RecordingHandler("event: metadata\ndata: {\"model\":\"glm-5.3__dev\"}\n\nevent: output\ndata: {\"response\":\"ok\"}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n");
         var client = new TraeClient(
             new TraeAuthData { Token = "test-token", ApiHost = "https://console.example" },
             httpMessageHandler: handler,
@@ -106,13 +106,13 @@ public sealed class TraeAgentClientTests
         handler.Headers["x-device-type"].Should().Be("windows");
         handler.Headers["x-ide-version"].Should().Be("0.1.43");
         handler.Headers["x-ide-version-code"].Should().Be("20260716");
-        events.Select(streamEvent => streamEvent.Event).Should().Equal("metadata", "output");
+        events.Select(streamEvent => streamEvent.Event).Should().Equal("metadata", "output", "done");
     }
 
     [TestMethod]
     public async Task ChatStreamAsync_UsesEnterpriseChatChannelWithConfigName()
     {
-        var handler = new RecordingHandler("event: metadata\ndata: {\"model\":\"glm-5.3\"}\n\nevent: output\ndata: {\"response\":\"ok\"}\n\n");
+        var handler = new RecordingHandler("event: metadata\ndata: {\"model\":\"glm-5.3\"}\n\nevent: output\ndata: {\"response\":\"ok\"}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n");
         var client = new TraeClient(
             new TraeAuthData { Token = "test-token", ApiHost = "https://console.example" },
             httpMessageHandler: handler);
@@ -128,13 +128,13 @@ public sealed class TraeAgentClientTests
         body.RootElement.GetProperty("function").GetString().Should().Be("chat_v3");
         body.RootElement.GetProperty("model").GetString().Should().Be("glm-5.3__dev");
         body.RootElement.GetProperty("config_name").GetString().Should().Be("glm-5.3");
-        events.Select(streamEvent => streamEvent.Event).Should().Equal("metadata", "output");
+        events.Select(streamEvent => streamEvent.Event).Should().Equal("metadata", "output", "done");
     }
 
     [TestMethod]
     public async Task ChatStreamAsync_AcceptsProviderInternalModelName()
     {
-        var handler = new RecordingHandler("event: metadata\ndata: {\"model\":\"ali-deepseek-v4-pro-0813\"}\n\nevent: output\ndata: {\"response\":\"ok\"}\n\n");
+        var handler = new RecordingHandler("event: metadata\ndata: {\"model\":\"ali-deepseek-v4-pro-0813\"}\n\nevent: output\ndata: {\"response\":\"ok\"}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n");
         var client = new TraeClient(
             new TraeAuthData { Token = "test-token", ApiHost = "https://console.example" },
             httpMessageHandler: handler);
@@ -145,7 +145,7 @@ public sealed class TraeAgentClientTests
             new TraeModelDescriptor("DeepSeek-V4-Pro-Official__dev", "DeepSeek-V4-Pro-Official", "DeepSeek-V4-Pro 正式版", TraeModelVariant.Dev)))
             events.Add(streamEvent);
 
-        events.Select(streamEvent => streamEvent.Event).Should().Equal("metadata", "output");
+        events.Select(streamEvent => streamEvent.Event).Should().Equal("metadata", "output", "done");
     }
 
     [TestMethod]

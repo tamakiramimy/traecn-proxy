@@ -53,7 +53,7 @@ services:
 			- ./data:/data
 ```
 
-首次启动后打开 [http://127.0.0.1:9220/admin](http://127.0.0.1:9220/admin)，使用 `TRANCN_ADMIN_KEY` 连接管理端，在“添加网页登录账号”中填写账号别名并完成 Trae CN 授权。可重复添加多个账号；授权凭据保存在 `/data`，容器重启后仍会保留。
+首次启动后打开 [http://127.0.0.1:9220/admin](http://127.0.0.1:9220/admin)，使用 `TRANCN_ADMIN_KEY` 连接管理端，在“添加网页登录账号”中填写账号别名和最大并发并完成 Trae CN 授权。新账号默认最大并发为 10，可在添加时覆盖，也可在账号池中随时调整。可重复添加多个账号；授权凭据和账号设置保存在 `/data`，容器重启后仍会保留。
 
 如果改用其他宿主机端口，例如 `127.0.0.1:10005:9220`，请同时设置 `TRANCN_PUBLIC_BASE_URL=http://127.0.0.1:10005`，并从该地址打开管理端重新发起授权。不要复用修改配置前生成的 OAuth 回调链接。
 
@@ -172,7 +172,9 @@ bridge 会记录活动请求关联的 Aha `request_stream` 出入站 envelope。
 
 账号库位于 `accounts.json`，首次运行会自动迁移旧的 `auth.json` 为 `default` 账号。JSON 可通过 `--account-import` 或管理端导入。多账号推荐使用独立网页授权，避免与 IDE 登录态竞争 refresh token。
 
-设置 `TRANCN_ADMIN_KEY` 后访问 `http://127.0.0.1:9220/admin`。管理端支持账号列表、JSON 导入、启停、刷新、测试、删除和 Trae 网页登录。远程部署网页登录时必须配置浏览器可访问的 `--public-base-url https://proxy.example.com`。
+设置 `TRANCN_ADMIN_KEY` 后访问 `http://127.0.0.1:9220/admin`。管理端支持账号列表、JSON 导入、启停、刷新、测试、删除、账号级最大并发和 Trae 网页登录。最大并发允许设置为 1 到 100；调度设置中的“新账号默认并发”只影响后续添加的账号，不会批量覆盖已有账号。在线降低并发不会中断正在进行的响应，只会暂时阻止新请求，直到在途请求数回落到新上限以内。远程部署网页登录时必须配置浏览器可访问的 `--public-base-url https://proxy.example.com`。
+
+sub2api 的账户并发和 traecn-proxy 的账号最大并发是两层独立限制。生产部署时应将两者配置为一致或让 sub2api 的限制更低；修改其中一层不会自动同步另一层。
 
 sub2api 可按调用协议配置为 OpenAI 或 Anthropic API Key 上游。Base URL 不要附加 `/v1`，由 sub2api 网关拼接具体 API 路径。
 

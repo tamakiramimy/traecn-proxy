@@ -9,7 +9,7 @@ public sealed class TraeAccount
     public string Alias { get; set; } = "default";
     public bool Enabled { get; set; } = true;
     public int Priority { get; set; }
-    public int MaxConcurrency { get; set; } = 1;
+    public int MaxConcurrency { get; set; } = TraeConcurrencyLimits.Default;
     public string DeviceId { get; set; } = "0";
     public string MachineId { get; set; } = "0";
     public TraeAuthData Auth { get; set; } = new();
@@ -23,7 +23,21 @@ public sealed class MultiAccountSettings
     public int Version { get; set; } = 1;
     public string LoadBalancing { get; set; } = "priority";
     public int SessionTtlMinutes { get; set; } = 60;
+    public int DefaultMaxConcurrency { get; set; } = TraeConcurrencyLimits.Default;
     public List<TraeAccount> Accounts { get; set; } = new();
+}
+
+public static class TraeConcurrencyLimits
+{
+    public const int Default = 10;
+    public const int Minimum = 1;
+    public const int Maximum = 100;
+
+    public static void Validate(int value)
+    {
+        if (value is < Minimum or > Maximum)
+            throw new InvalidOperationException($"最大并发必须介于 {Minimum} 到 {Maximum} 之间。");
+    }
 }
 
 public sealed class TraeAccountStore
@@ -153,6 +167,9 @@ public sealed class MultiAccountManager
         _store = store;
         _chatApiHost = chatApiHost;
         Settings = store.LoadOrMigrate();
+        ValidateSettings(Settings.LoadBalancing, Settings.SessionTtlMinutes, Settings.DefaultMaxConcurrency);
+        foreach (var account in Settings.Accounts)
+            ValidateMaxConcurrency(account.MaxConcurrency);
         foreach (var account in Settings.Accounts)
             _accounts[account.Id] = new TraeAccountRuntime(account, _chatApiHost);
     }
@@ -165,6 +182,7 @@ public sealed class MultiAccountManager
     {
         if (string.IsNullOrWhiteSpace(account.Alias))
             throw new InvalidOperationException("账号别名不能为空。");
+        TraeConcurrencyLimits.Validate(account.MaxConcurrency);
 
         lock (_selectionGate)
         {
@@ -219,16 +237,32 @@ public sealed class MultiAccountManager
         }
     }
 
-    public void UpdateSettings(string loadBalancing, int sessionTtlMinutes)
+    public bool SetMaxConcurrency(string alias, int maxConcurrency)
+    {
+        TraeConcurrencyLimits.Validate(maxConcurrency);
+        lock (_selectionGate)
+        {
+            var runtime = FindRuntime(alias);
+            if (runtime is null) return false;
+            runtime.Account.MaxConcurrency = maxConcurrency;
+            _store.Save(Settings);
+            return true;
+        }
+    }
+
+    public void UpdateSettings(string loadBalancing, int sessionTtlMinutes, int? defaultMaxConcurrency = null)
     {
         if (loadBalancing is not ("priority" or "balanced"))
             throw new InvalidOperationException("负载策略仅支持 priority 或 balanced。");
         if (sessionTtlMinutes is < 1 or > 1440)
             throw new InvalidOperationException("会话 TTL 必须介于 1 到 1440 分钟之间。");
+        int newDefaultMaxConcurrency = defaultMaxConcurrency ?? Settings.DefaultMaxConcurrency;
+        TraeConcurrencyLimits.Validate(newDefaultMaxConcurrency);
         lock (_selectionGate)
         {
             Settings.LoadBalancing = loadBalancing;
             Settings.SessionTtlMinutes = sessionTtlMinutes;
+            Settings.DefaultMaxConcurrency = newDefaultMaxConcurrency;
             _store.Save(Settings);
         }
     }
@@ -263,7 +297,9 @@ public sealed class MultiAccountManager
         if (settings.Accounts.Where(x => !string.IsNullOrWhiteSpace(x.Id))
             .GroupBy(x => x.Id, StringComparer.OrdinalIgnoreCase).Any(x => x.Count() > 1))
             throw new InvalidDataException("导入文件中存在重复账号 ID。");
-        ValidateSettings(settings.LoadBalancing, settings.SessionTtlMinutes);
+        ValidateSettings(settings.LoadBalancing, settings.SessionTtlMinutes, settings.DefaultMaxConcurrency);
+        foreach (var account in settings.Accounts)
+            ValidateMaxConcurrency(account.MaxConcurrency);
 
         foreach (var account in settings.Accounts)
             if (string.IsNullOrWhiteSpace(account.Id)) account.Id = Guid.NewGuid().ToString("N");
@@ -374,12 +410,19 @@ public sealed class MultiAccountManager
             ? candidates.OrderBy(x => x.InFlight).ThenBy(x => x.Account.LastUsedAt ?? DateTimeOffset.MinValue).ThenBy(x => x.Account.Priority)
             : candidates.OrderBy(x => x.Account.Priority).ThenBy(x => x.InFlight).ThenBy(x => x.Account.LastUsedAt ?? DateTimeOffset.MinValue);
 
-    private static void ValidateSettings(string loadBalancing, int sessionTtlMinutes)
+    private static void ValidateSettings(string loadBalancing, int sessionTtlMinutes, int defaultMaxConcurrency)
     {
         if (loadBalancing is not ("priority" or "balanced"))
             throw new InvalidDataException("负载策略仅支持 priority 或 balanced。");
         if (sessionTtlMinutes is < 1 or > 1440)
             throw new InvalidDataException("会话 TTL 必须介于 1 到 1440 分钟之间。");
+        ValidateMaxConcurrency(defaultMaxConcurrency);
+    }
+
+    private static void ValidateMaxConcurrency(int maxConcurrency)
+    {
+        if (maxConcurrency is < TraeConcurrencyLimits.Minimum or > TraeConcurrencyLimits.Maximum)
+            throw new InvalidDataException($"最大并发必须介于 {TraeConcurrencyLimits.Minimum} 到 {TraeConcurrencyLimits.Maximum} 之间。");
     }
 
     private TraeAccountRuntime? FindRuntime(string alias) => _accounts.Values.FirstOrDefault(x =>

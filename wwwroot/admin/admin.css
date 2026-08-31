@@ -126,7 +126,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--teal-700); box-s
 .field-action:hover { color: var(--teal-700); background: var(--teal-50); }
 
 .account-list { overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius-sm); }
-.account-row { display: grid; grid-template-columns: minmax(190px, 1.35fr) minmax(105px, .75fr) 82px minmax(154px, 1fr) minmax(130px, 1.05fr) 206px; align-items: center; min-height: 74px; border-bottom: 1px solid var(--line); background: var(--surface); transition: background-color .16s ease, opacity .16s ease; }
+.account-row { display: grid; grid-template-columns: minmax(175px, 1.25fr) minmax(100px, .7fr) 74px 88px minmax(146px, .95fr) minmax(120px, .9fr) 206px; align-items: center; min-height: 74px; border-bottom: 1px solid var(--line); background: var(--surface); transition: background-color .16s ease, opacity .16s ease; }
 .account-row:last-child { border-bottom: 0; }
 .account-row:not(.account-header):hover { background: #fbfdfd; }
 .account-row.disabled { background: var(--surface-subtle); opacity: .76; }
@@ -143,7 +143,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--teal-700); box-s
 .badge.warning { color: var(--warning); background: var(--warning-bg); }
 .badge.danger { color: var(--danger); background: var(--danger-bg); }
 .badge.muted { color: var(--muted); background: #edf1f5; }
-.priority-field input { width: 58px; min-height: 44px; padding: 8px 9px; font-variant-numeric: tabular-nums; }
+.priority-field input, .concurrency-field input { width: 58px; min-height: 44px; padding: 8px 9px; font-variant-numeric: tabular-nums; }
 .error-cell { display: flex; align-items: center; gap: 7px; color: var(--soft); font-size: 11px; }
 .error-cell svg { width: 15px; height: 15px; flex: 0 0 15px; color: var(--danger); }
 .error-cell span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -182,8 +182,8 @@ input:focus, select:focus, textarea:focus { border-color: var(--teal-700); box-s
 @keyframes toast-in { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 
 @media (max-width: 1080px) {
-  .account-row { grid-template-columns: minmax(180px, 1.3fr) 100px 72px minmax(145px, .95fr) 206px; }
-  .account-row > :nth-child(5), .account-header > :nth-child(5) { display: none; }
+  .account-row { grid-template-columns: minmax(170px, 1.2fr) 96px 70px 84px minmax(140px, .9fr) 206px; }
+  .account-row > :nth-child(6), .account-header > :nth-child(6) { display: none; }
   .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
@@ -198,7 +198,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--teal-700); box-s
   .account-row:not(.account-header) { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; margin-bottom: 12px; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius-md); box-shadow: var(--shadow-sm); }
   .account-row:not(.account-header):last-child { border-bottom: 1px solid var(--line); }
   .account-row > * { padding: 8px 0; }
-  .account-row > :nth-child(5) { display: flex; }
+  .account-row > :nth-child(6) { display: flex; }
   .account-identity { grid-column: 1 / -1; padding-top: 0; padding-bottom: 13px; border-bottom: 1px solid var(--line); }
   .account-row [data-label]::before { display: block; margin-bottom: 4px; color: var(--soft); content: attr(data-label); font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
   .account-identity::before, .actions::before { display: none !important; }
@@ -239,7 +239,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--teal-700); box-s
   .auth-intro, .auth-card { padding: 25px 20px; }
   .auth-intro h2 { font-size: 24px; }
   .account-row:not(.account-header) { grid-template-columns: 1fr; }
-  .date-cell, .priority-field { border-top: 1px dashed var(--line); }
+  .date-cell, .priority-field, .concurrency-field { border-top: 1px dashed var(--line); }
   .actions { justify-content: space-between; }
   .icon-button { width: 44px; height: 44px; flex-basis: 44px; }
   .toast { right: 10px; bottom: 10px; width: calc(100vw - 20px); }

@@ -104,7 +104,7 @@
 
           <div class="account-list" role="region" aria-live="polite" aria-label="账号列表">
             <div class="account-row account-header" aria-hidden="true">
-              <span>账号</span><span>状态</span><span>优先级</span><span>Token 到期</span><span>最近错误</span><span>操作</span>
+              <span>账号</span><span>状态</span><span>优先级</span><span>最大并发</span><span>Token 到期</span><span>最近错误</span><span>操作</span>
             </div>
             <article class="account-row" v-for="account in accounts" :key="account.alias" :class="{ disabled: !account.enabled }">
               <div class="account-identity" data-label="账号">
@@ -119,6 +119,10 @@
               <label class="priority-field" data-label="优先级" :for="`priority-${account.alias}`">
                 <span class="sr-only">{{ account.alias }} 优先级</span>
                 <input :id="`priority-${account.alias}`" type="number" v-model.number="account.priority" @change="setPriority(account)" :disabled="isBusy(`priority:${account.alias}`)">
+              </label>
+              <label class="concurrency-field" data-label="最大并发" :for="`concurrency-${account.alias}`">
+                <span class="sr-only">{{ account.alias }} 最大并发</span>
+                <input :id="`concurrency-${account.alias}`" type="number" min="1" max="100" step="1" required v-model.number="account.max_concurrency" @change="setMaxConcurrency(account)" :disabled="isBusy(`concurrency:${account.alias}`)">
               </label>
               <div class="date-cell" data-label="Token 到期"><strong>{{ formatDate(account.token_expires) }}</strong><small>{{ relativeExpiry(account.token_expires) }}</small></div>
               <div class="error-cell" data-label="最近错误" :title="account.last_error || ''">
@@ -156,6 +160,9 @@
               <label for="login-alias">账号别名</label>
               <input id="login-alias" v-model.trim="loginAlias" placeholder="例如 team-a" required pattern="[A-Za-z0-9_-]+" autocomplete="off">
               <p class="helper">仅支持字母、数字、短横线和下划线。</p>
+              <label for="login-max-concurrency">最大并发</label>
+              <input id="login-max-concurrency" v-model.number="loginMaxConcurrency" type="number" min="1" max="100" step="1" required>
+              <p class="helper">该账号同时处理的请求数，可在账号池中随时调整。</p>
               <button class="button primary" type="submit" :disabled="isBusy('login') || !loginAlias">
                 <span class="spinner" v-if="isBusy('login')"></span><svg v-else viewBox="0 0 24 24"><path d="M14 5h5v5M10 14 19 5M19 14v5H5V5h5"/></svg>
                 {{ isBusy('login') ? '正在创建授权…' : '打开 Trae 授权' }}
@@ -170,6 +177,7 @@
             <form class="settings-form" @submit.prevent="saveSettings">
               <label for="load-balancing">调度策略<select id="load-balancing" v-model="settings.load_balancing"><option value="priority">优先级调度</option><option value="balanced">并发均衡</option></select></label>
               <label for="session-ttl">粘滞时间（分钟）<input id="session-ttl" v-model.number="settings.session_ttl_minutes" type="number" min="1" max="1440" required></label>
+              <label for="default-max-concurrency">新账号默认并发<input id="default-max-concurrency" v-model.number="settings.default_max_concurrency" type="number" min="1" max="100" step="1" required></label>
               <button class="button primary" type="submit" :disabled="isBusy('settings')">
                 <span class="spinner" v-if="isBusy('settings')"></span><svg v-else viewBox="0 0 24 24"><path d="M5 12 9 16 19 6"/></svg>
                 {{ isBusy('settings') ? '正在保存…' : '保存设置' }}

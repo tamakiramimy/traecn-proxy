@@ -12,6 +12,15 @@ public sealed class TraeModelSelectionException(string requestedModel, string ac
 {
 }
 
+public sealed class TraeUpstreamException(string message) : InvalidOperationException(message)
+{
+}
+
+public sealed class TraeIncompleteStreamException()
+    : InvalidOperationException("Trae 响应在完成事件前中断。")
+{
+}
+
 /// <summary>
 /// Trae CN(企业版)上游 API 客户端。自动走系统代理(企业网络必需)。
 /// </summary>
@@ -287,33 +296,74 @@ public class TraeClient
         await using var stream = await resp.Content.ReadAsStreamAsync(ct);
         using var reader = new StreamReader(stream);
         string? eventName = null;
+        var dataLines = new List<string>();
         bool receivedMetadata = false;
+
+        TraeSseEvent? TakeFrame()
+        {
+            if (dataLines.Count == 0)
+            {
+                eventName = null;
+                return null;
+            }
+
+            var frame = new TraeSseEvent(eventName ?? "message", string.Join('\n', dataLines));
+            eventName = null;
+            dataLines.Clear();
+            return frame;
+        }
+
         while (await reader.ReadLineAsync(ct) is { } line)
         {
-            string t = line.Trim();
-            if (t.Length == 0) continue;
-            if (t.StartsWith("event:"))
+            if (line.Length == 0)
             {
-                eventName = t[6..].Trim();
+                var frame = TakeFrame();
+                if (frame is null) continue;
+                ValidateFrame(frame);
+                yield return frame;
+                if (frame.Event == "done") yield break;
                 continue;
             }
-            if (t.StartsWith("data:"))
+
+            if (line[0] == ':') continue;
+            int separator = line.IndexOf(':');
+            string field = separator < 0 ? line : line[..separator];
+            string value = separator < 0 ? "" : line[(separator + 1)..];
+            if (value.StartsWith(' ')) value = value[1..];
+            if (field == "event") eventName = value;
+            else if (field == "data") dataLines.Add(value);
+        }
+
+        var finalFrame = TakeFrame();
+        if (finalFrame is not null)
+        {
+            ValidateFrame(finalFrame);
+            yield return finalFrame;
+            if (finalFrame.Event == "done") yield break;
+        }
+        throw new TraeIncompleteStreamException();
+
+        void ValidateFrame(TraeSseEvent frame)
+        {
+            JsonObject? payload = null;
+            if (frame.Event is "metadata" or "output" or "error")
+                payload = JsonNode.Parse(frame.Data) as JsonObject;
+            if (frame.Event == "error")
             {
-                string data = t[5..].Trim();
-                if (eventName == "metadata")
-                {
-                    receivedMetadata = true;
-                    string? actualModel = (string?)(JsonNode.Parse(data) as JsonObject)?["model"];
-                    if (!string.IsNullOrWhiteSpace(actualModel) && !MatchesRequestedModel(model, actualModel))
-                        throw new TraeModelSelectionException(model, actualModel);
-                }
-                else if (eventName == "output" && !receivedMetadata)
-                {
-                    throw new InvalidOperationException("Trae 响应缺少模型 metadata，无法确认实际调用模型。");
-                }
-                yield return new TraeSseEvent(eventName ?? "", data);
-                eventName = null;
+                string message = (string?)payload?["message"]
+                    ?? (string?)payload?["error"]?["message"]
+                    ?? "Trae 上游返回错误事件。";
+                throw new TraeUpstreamException(message);
             }
+            if (frame.Event == "metadata")
+            {
+                receivedMetadata = true;
+                string? actualModel = (string?)payload?["model"];
+                if (!string.IsNullOrWhiteSpace(actualModel) && !MatchesRequestedModel(model, actualModel))
+                    throw new TraeModelSelectionException(model, actualModel);
+            }
+            else if (frame.Event == "output" && !receivedMetadata)
+                throw new TraeUpstreamException("Trae 响应缺少模型 metadata，无法确认实际调用模型。");
         }
     }
 

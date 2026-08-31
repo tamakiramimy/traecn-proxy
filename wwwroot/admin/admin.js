@@ -4,9 +4,10 @@ createApp({
   setup() {
     const adminKey = ref(sessionStorage.getItem('trancnAdminKey') || '');
     const accounts = ref([]);
-    const settings = ref({ load_balancing: 'priority', session_ttl_minutes: 60 });
+    const settings = ref({ load_balancing: 'priority', session_ttl_minutes: 60, default_max_concurrency: 10 });
     const importJson = ref('');
     const loginAlias = ref('');
+    const loginMaxConcurrency = ref(10);
     const connected = ref(false);
     const busy = ref(new Set());
     const notice = ref(null);
@@ -71,6 +72,7 @@ createApp({
       const data = await api('/admin/api/accounts');
       accounts.value = data.accounts || [];
       settings.value = data.settings || settings.value;
+      loginMaxConcurrency.value = settings.value.default_max_concurrency || 10;
       connected.value = true;
       sessionStorage.setItem('trancnAdminKey', adminKey.value);
       return data;
@@ -105,8 +107,15 @@ createApp({
     };
     const setPriority = account => runAction(`priority:${account.alias}`, () =>
       api(`/admin/api/accounts/${encodeURIComponent(account.alias)}/priority/${account.priority}`, { method: 'POST' }), `${account.alias} 优先级已更新`);
-    const saveSettings = () => runAction('settings', () =>
-      api('/admin/api/settings', { method: 'PUT', body: JSON.stringify(settings.value) }), '调度设置已保存');
+    const setMaxConcurrency = account => runAction(`concurrency:${account.alias}`, async () => {
+      try {
+        await api(`/admin/api/accounts/${encodeURIComponent(account.alias)}/max-concurrency/${account.max_concurrency}`, { method: 'POST' });
+      } finally { await fetchAccounts(); }
+    }, `${account.alias} 最大并发已更新`);
+    const saveSettings = () => runAction('settings', async () => {
+      await api('/admin/api/settings', { method: 'PUT', body: JSON.stringify(settings.value) });
+      loginMaxConcurrency.value = settings.value.default_max_concurrency;
+    }, '调度设置已保存');
     const importAccounts = () => {
       if (!window.confirm('导入会完整替换当前账号集合。\n\n建议先备份 accounts.json，是否继续？')) return;
       return runAction('import', async () => {
@@ -117,6 +126,11 @@ createApp({
     };
     const startLogin = async () => {
       if (isBusy('login')) return;
+      const maxConcurrency = Number(loginMaxConcurrency.value);
+      if (!Number.isInteger(maxConcurrency) || maxConcurrency < 1 || maxConcurrency > 100) {
+        showNotice('最大并发必须是 1 到 100 之间的整数。', 'error');
+        return;
+      }
       // 在用户点击的同步调用栈内创建窗口，避免异步请求后被浏览器判定为弹窗。
       const popup = window.open('', '_blank');
       if (!popup) {
@@ -126,7 +140,10 @@ createApp({
       popup.opener = null;
       setBusy('login', true);
       try {
-        const data = await api('/admin/api/accounts/login/start', { method: 'POST', body: JSON.stringify({ alias: loginAlias.value }) });
+        const data = await api('/admin/api/accounts/login/start', {
+          method: 'POST',
+          body: JSON.stringify({ alias: loginAlias.value, max_concurrency: maxConcurrency })
+        });
         popup.location.replace(data.authorization_url);
         showNotice('已打开 Trae 授权页，完成后请刷新账号池。');
       } catch (error) {
@@ -159,9 +176,9 @@ createApp({
     if (adminKey.value) loadAccounts('connect');
 
     return {
-      adminKey, accounts, settings, importJson, loginAlias, connected, notice, showKey,
+      adminKey, accounts, settings, importJson, loginAlias, loginMaxConcurrency, connected, notice, showKey,
       enabledCount, disabledCount, strategyLabel, isBusy, connect, loadAccounts, toggleAccount,
-      refreshAccount, testAccount, removeAccount, setPriority, saveSettings, importAccounts,
+      refreshAccount, testAccount, removeAccount, setPriority, setMaxConcurrency, saveSettings, importAccounts,
       startLogin, formatDate, relativeExpiry, tokenState, initials
     };
   }

@@ -9,15 +9,17 @@ public sealed class TraeOAuthLoginManager
 {
     private readonly ConcurrentDictionary<string, PendingLogin> _pending = new(StringComparer.Ordinal);
 
-    public string Begin(string alias, string callbackUrl, string deviceId, string machineId)
+    public string Begin(string alias, string callbackUrl, string deviceId, string machineId,
+        int maxConcurrency = TraeConcurrencyLimits.Default)
     {
         if (string.IsNullOrWhiteSpace(alias)) throw new InvalidOperationException("账号别名不能为空。");
         if (!Uri.TryCreate(callbackUrl, UriKind.Absolute, out _)) throw new InvalidOperationException("public base URL 无效。");
+        TraeConcurrencyLimits.Validate(maxConcurrency);
 
         string state = ToUrlSafe(RandomNumberGenerator.GetBytes(32));
         string verifier = ToUrlSafe(RandomNumberGenerator.GetBytes(48));
         string challenge = ToUrlSafe(SHA256.HashData(Encoding.ASCII.GetBytes(verifier)));
-        _pending[state] = new PendingLogin(alias, verifier, deviceId, machineId, DateTimeOffset.UtcNow.AddMinutes(5));
+        _pending[state] = new PendingLogin(alias, verifier, deviceId, machineId, maxConcurrency, DateTimeOffset.UtcNow.AddMinutes(5));
         RemoveExpired();
 
         var query = new Dictionary<string, string>
@@ -81,6 +83,7 @@ public sealed class TraeOAuthLoginManager
         return new TraeAccount
         {
             Alias = pending.Alias,
+            MaxConcurrency = pending.MaxConcurrency,
             Auth = auth,
             DeviceId = pending.DeviceId,
             MachineId = pending.MachineId
@@ -106,5 +109,6 @@ public sealed class TraeOAuthLoginManager
         return long.TryParse(value, out var milliseconds) && milliseconds > 0 ? DateTimeOffset.FromUnixTimeMilliseconds(milliseconds) : null;
     }
 
-    private sealed record PendingLogin(string Alias, string Verifier, string DeviceId, string MachineId, DateTimeOffset ExpiresAt);
+    private sealed record PendingLogin(string Alias, string Verifier, string DeviceId, string MachineId,
+        int MaxConcurrency, DateTimeOffset ExpiresAt);
 }
