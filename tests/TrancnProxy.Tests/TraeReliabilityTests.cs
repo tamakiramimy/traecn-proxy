@@ -1,6 +1,7 @@
 using System.Net;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.Json.Nodes;
 using FluentAssertions;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 
@@ -145,6 +146,53 @@ public sealed class TraeReliabilityTests
         }
 
         heartbeatCount.Should().BeGreaterThanOrEqualTo(2);
+    }
+
+    [TestMethod]
+    public void AnthropicThinking_ContentBlockStartHasEmptySignaturePlaceholder()
+    {
+        var block = TraeAnthropicThinking.ContentBlockStart();
+
+        block["type"]!.ToString().Should().Be("thinking");
+        block["thinking"]!.ToString().Should().Be("");
+        block["signature"]!.ToString().Should().Be("");
+    }
+
+    [TestMethod]
+    public void AnthropicThinking_SignatureDeltaIsNonEmptySoClientsAcceptTheBlock()
+    {
+        var delta = TraeAnthropicThinking.SignatureDelta();
+
+        delta["type"]!.ToString().Should().Be("signature_delta");
+        delta["signature"]!.ToString().Should().NotBeNullOrEmpty();
+    }
+
+    [TestMethod]
+    public void AnthropicThinking_CompletedContentIncludesSignature()
+    {
+        var content = TraeAnthropicThinking.CompletedContent("because X, therefore Y");
+
+        content["type"]!.ToString().Should().Be("thinking");
+        content["thinking"]!.ToString().Should().Be("because X, therefore Y");
+        content["signature"]!.ToString().Should().NotBeNullOrEmpty();
+    }
+
+    [TestMethod]
+    public void AnthropicThinking_TreatsAdaptiveAsEnabled()
+    {
+        // Real Claude Desktop sends exactly this shape.
+        var adaptive = JsonNode.Parse("""{"type":"adaptive","display":"omitted"}""");
+
+        TraeAnthropicThinking.IsEnabled(adaptive).Should().BeTrue();
+    }
+
+    [TestMethod]
+    public void AnthropicThinking_TreatsEnabledAsEnabledAndDisabledAsOff()
+    {
+        TraeAnthropicThinking.IsEnabled(JsonNode.Parse("""{"type":"enabled","budget_tokens":1024}""")).Should().BeTrue();
+        TraeAnthropicThinking.IsEnabled(JsonNode.Parse("""{"type":"disabled"}""")).Should().BeFalse();
+        TraeAnthropicThinking.IsEnabled(null).Should().BeFalse();
+        TraeAnthropicThinking.IsEnabled(JsonNode.Parse("{}")).Should().BeFalse();
     }
 
     private static TraeClient CreateClient(HttpMessageHandler handler) => new(

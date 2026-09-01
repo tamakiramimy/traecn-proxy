@@ -390,7 +390,7 @@ app.MapPost("/v1/messages", async (HttpContext ctx) =>
     string? requestedModel = (string?)body["model"];
     bool stream = body["stream"] is JsonValue sv && sv.TryGetValue<bool>(out var sb) && sb;
     var tools = body["tools"] as JsonArray;
-    bool thinkingEnabled = string.Equals((string?)body["thinking"]?["type"], "enabled", StringComparison.OrdinalIgnoreCase);
+    bool thinkingEnabled = TraeAnthropicThinking.IsEnabled(body["thinking"]);
     var messages = ConvertAnthropicMessages(body, thinkingEnabled);
     if (messages.Count == 0)
         return Results.BadRequest(new { type = "error", error = new { message = "messages is required", type = "invalid_request_error" } });
@@ -839,8 +839,29 @@ async Task<JsonObject> CollectAnthropic(
     bool hasToolUse = false;
     bool hasNativeReasoning = thinkingEnabled && !string.IsNullOrWhiteSpace(result.Reasoning);
     if (hasNativeReasoning)
-        content.Add(new JsonObject { ["type"] = "thinking", ["thinking"] = result.Reasoning });
+        content.Add(TraeAnthropicThinking.CompletedContent(result.Reasoning));
     var thinking = new StringBuilder();
+    string? pendingToolId = null;
+    string? pendingToolName = null;
+    var pendingToolInput = new StringBuilder();
+
+    void AddText(string text) => content.Add(new JsonObject { ["type"] = "text", ["text"] = text });
+
+    void AddToolUse(TraeToolUseBlock candidate)
+    {
+        if (!TraeToolProtocol.TryValidateToolUse(candidate, tools, out string validationError))
+        {
+            AddText(InvalidToolCallMessage(candidate.Name, validationError));
+            return;
+        }
+        hasToolUse = true;
+        content.Add(new JsonObject
+        {
+            ["type"] = "tool_use", ["id"] = candidate.Id,
+            ["name"] = candidate.Name, ["input"] = candidate.Input.DeepClone()
+        });
+    }
+
     foreach (TraeOutputBlock block in TraeToolProtocol.Parse(result.Text))
     {
         if (block is TraeThinkingDeltaBlock thinkingDelta && !hasNativeReasoning)
@@ -848,32 +869,40 @@ async Task<JsonObject> CollectAnthropic(
         else if (block is TraeThinkingEndBlock && !hasNativeReasoning)
         {
             if (thinking.Length > 0)
-                content.Add(new JsonObject
-                {
-                    ["type"] = "thinking", ["thinking"] = thinking.ToString()
-                });
+                content.Add(TraeAnthropicThinking.CompletedContent(thinking.ToString()));
             thinking.Clear();
         }
         else if (block is TraeTextBlock textBlock && !string.IsNullOrWhiteSpace(textBlock.Text))
-            content.Add(new JsonObject { ["type"] = "text", ["text"] = textBlock.Text });
-        else if (block is TraeToolUseBlock toolUse)
+            AddText(textBlock.Text);
+        else if (block is TraeToolUseStartBlock toolStart)
         {
-            if (!TraeToolProtocol.TryValidateToolUse(toolUse, tools, out string validationError))
+            pendingToolId = toolStart.Id;
+            pendingToolName = toolStart.Name;
+            pendingToolInput.Clear();
+        }
+        else if (block is TraeToolInputDeltaBlock toolDelta && pendingToolName is not null)
+            pendingToolInput.Append(toolDelta.PartialJson);
+        else if (block is TraeToolUseEndBlock && pendingToolName is not null)
+        {
+            string id = pendingToolId ?? $"toolu_{Guid.NewGuid():N}";
+            string name = pendingToolName;
+            string serializedInput = pendingToolInput.ToString();
+            pendingToolId = null;
+            pendingToolName = null;
+            pendingToolInput.Clear();
+
+            JsonObject input;
+            try { input = JsonNode.Parse(serializedInput) as JsonObject ?? new JsonObject(); }
+            catch (JsonException)
             {
-                content.Add(new JsonObject
-                {
-                    ["type"] = "text",
-                    ["text"] = InvalidToolCallMessage(toolUse.Name, validationError)
-                });
+                LogRejectedToolCall(name, "arguments are not valid JSON", serializedInput);
+                AddText(InvalidToolCallMessage(name, "arguments are not valid JSON"));
                 continue;
             }
-            hasToolUse = true;
-            content.Add(new JsonObject
-            {
-                ["type"] = "tool_use", ["id"] = toolUse.Id,
-                ["name"] = toolUse.Name, ["input"] = toolUse.Input.DeepClone()
-            });
+            AddToolUse(new TraeToolUseBlock(id, name, input));
         }
+        else if (block is TraeToolUseBlock toolUse)
+            AddToolUse(toolUse);
     }
     if (content.Count == 0) throw new TraeUpstreamException("Trae 上游完成但未返回有效内容。");
     return new JsonObject
@@ -943,6 +972,16 @@ async Task WriteAnthropicStream(
     async Task CloseBlock()
     {
         if (!blockOpen) return;
+        if (blockType == "thinking")
+        {
+            // Required by the Anthropic streaming spec: a signature_delta must precede
+            // content_block_stop for thinking blocks, or strict clients may discard the block.
+            await WriteEvent("content_block_delta", new JsonObject
+            {
+                ["type"] = "content_block_delta", ["index"] = blockIndex,
+                ["delta"] = TraeAnthropicThinking.SignatureDelta()
+            });
+        }
         await WriteEvent("content_block_stop", new JsonObject { ["type"] = "content_block_stop", ["index"] = blockIndex });
         blockOpen = false;
         blockType = null;
@@ -1025,6 +1064,7 @@ async Task WriteAnthropicStream(
             try { input = JsonNode.Parse(serializedInput) as JsonObject ?? new JsonObject(); }
             catch (JsonException)
             {
+                LogRejectedToolCall(name, "arguments are not valid JSON", serializedInput);
                 await WriteBlock(new TraeTextBlock(InvalidToolCallMessage(name, "arguments are not valid JSON")));
                 return;
             }
@@ -1040,7 +1080,7 @@ async Task WriteAnthropicStream(
             await WriteEvent("content_block_start", new JsonObject
             {
                 ["type"] = "content_block_start", ["index"] = blockIndex,
-                ["content_block"] = new JsonObject { ["type"] = "thinking", ["thinking"] = "" }
+                ["content_block"] = TraeAnthropicThinking.ContentBlockStart()
             });
         }
         else if (block is TraeThinkingDeltaBlock thinkingDelta && blockType == "thinking" && !sawNativeReasoning)
@@ -1085,7 +1125,7 @@ async Task WriteAnthropicStream(
                         await WriteEvent("content_block_start", new JsonObject
                         {
                             ["type"] = "content_block_start", ["index"] = blockIndex,
-                            ["content_block"] = new JsonObject { ["type"] = "thinking", ["thinking"] = "" }
+                            ["content_block"] = TraeAnthropicThinking.ContentBlockStart()
                         });
                     }
                     await WriteEvent("content_block_delta", new JsonObject
@@ -1149,6 +1189,14 @@ async Task WriteAnthropicStream(
 
 string InvalidToolCallMessage(string toolName, string error) =>
     $"The tool call '{toolName}' was not executed because the model returned invalid arguments ({error}). Please retry the request.";
+
+// 模型输出不可重现，拒绝时必须留下载荷片段才能事后定位格式问题。
+void LogRejectedToolCall(string toolName, string error, string payload)
+{
+    const int maxLogged = 600;
+    string snippet = payload.Length <= maxLogged ? payload : payload[..maxLogged] + $"...(+{payload.Length - maxLogged} chars)";
+    Console.Error.WriteLine($"[tool-reject] {toolName}: {error}. raw={snippet.ReplaceLineEndings("\\n")}");
+}
 
 List<(string role, string text)> ConvertResponsesInput(JsonNode? input) => input switch
 {

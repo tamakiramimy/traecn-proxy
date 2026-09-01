@@ -32,9 +32,9 @@ public static class TraeToolProtocol
         ("<think>", "</think>")
     };
 
-    // 模型常以自身原生 XML 语法发起工具调用（DeepSeek 用全角 ｜DSML｜），需与 <tool_call> JSON 一并识别。
+    // 模型常以自身原生 XML 语法发起工具调用（DeepSeek 用全角 ｜DSML｜，Qwen 用带 name 属性的 tool_call），需与 <tool_call> JSON 一并识别。
     private static readonly Regex XmlToolOpen = new(
-        "<(?<tag>｜DSML｜|antml:invoke|invoke|function_call)\\s+name\\s*=\\s*[\"'](?<name>[^\"']+)[\"']\\s*>",
+        "<(?<tag>｜DSML｜|antml:invoke|invoke|function_call|tool_call)\\s+name\\s*=\\s*[\"'](?<name>[^\"']+)[\"']\\s*>",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly Regex XmlToolParameter = new(
         "<parameter\\s+name\\s*=\\s*[\"'](?<key>[^\"']+)[\"']\\s*>(?<value>.*?)</parameter>",
@@ -52,6 +52,7 @@ public static class TraeToolProtocol
     {
         OpenTag, "<thinking>", "<think>",
         "<｜DSML｜", "<invoke", "<invoke", "<function_call",
+        "<tool_call",
         "<tool_calls>", "<function_calls>", "<function_calls>",
         "</tool_calls>", "</function_calls>", "</function_calls>"
     };
@@ -90,9 +91,12 @@ public static class TraeToolProtocol
                 _ => "Call an available tool whenever it is needed to complete the request. Requests to create, read, modify, search, run, or inspect files, code, commands, or workspace state MUST use the appropriate tools. Never claim that an action was completed without a successful tool result."
             };
             sections.Add(choiceInstruction + "\n" + """
-You have access to the tools described below. When a tool is needed, output exactly one JSON object inside these tags and do not describe the call as prose.
-The object keys MUST be in this order: name first, arguments second:
+You have access to the tools described below. When a tool is needed, emit a tool call using one of the two forms below and do not describe the call as prose.
+Form A (preferred for short values) — one JSON object whose keys MUST be in this order, name first, arguments second:
 <tool_call>{"name":"tool_name","arguments":{"parameter":"value"}}</tool_call>
+Form B (use whenever a value is long or spans multiple lines, such as file contents or code) — raw values, so you never need to escape quotes or newlines:
+<tool_call name="tool_name"><parameter name="parameter">raw value</parameter></tool_call>
+Never mix the two forms in a single call, and never wrap a Form B value in JSON quoting.
 Every property listed in the tool's input_schema.required array MUST be present and non-empty. Never emit an empty arguments object when required properties exist.
 You may emit multiple tool_call blocks when calls can run in parallel. Tool definitions:
 """ + "\n" + tools.ToJsonString());
@@ -548,10 +552,35 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
         private static void EmitXmlToolInput(List<TraeOutputBlock> blocks, string body)
         {
             var input = new JsonObject();
+            bool sawParameter = false;
             foreach (Match parameter in XmlToolParameter.Matches(body))
+            {
+                sawParameter = true;
                 input[parameter.Groups["key"].Value] = ParameterValue(parameter.Groups["value"].Value);
+            }
+            // 部分模型在属性式标签内直接放 JSON 参数，而不是 <parameter> 子元素。
+            if (!sawParameter && TryParseArgumentObject(body) is { } jsonBody) input = jsonBody;
             blocks.Add(new TraeToolInputDeltaBlock(input.ToJsonString()));
             blocks.Add(new TraeToolUseEndBlock());
+        }
+
+        private static JsonObject? TryParseArgumentObject(string body)
+        {
+            string trimmed = body.Trim();
+            if (trimmed.Length == 0 || trimmed[0] != '{') return null;
+            try
+            {
+                if (JsonNode.Parse(MalformedObjectSeparator.Replace(trimmed, ",")) is not JsonObject parsed) return null;
+                JsonNode? arguments = parsed["arguments"] ?? parsed["input"] ?? parsed["parameters"];
+                if (arguments is JsonValue value && value.TryGetValue<string>(out string? serialized))
+                    arguments = JsonNode.Parse(serialized ?? "{}");
+                if (arguments is JsonObject argumentObject) return (JsonObject)argumentObject.DeepClone();
+                return parsed["name"] is not null ? new JsonObject() : parsed;
+            }
+            catch (System.Text.Json.JsonException)
+            {
+                return null;
+            }
         }
 
         private static JsonNode? ParameterValue(string raw)

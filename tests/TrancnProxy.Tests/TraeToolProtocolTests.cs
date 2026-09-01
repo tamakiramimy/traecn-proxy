@@ -312,4 +312,109 @@ public sealed class TraeToolProtocolTests
         text.Should().Be("<!DOCTYPE html>\n<div class=\"a\">hi</div>");
         blocks.OfType<TraeToolUseStartBlock>().Should().BeEmpty();
     }
+
+    [TestMethod]
+    public void Parse_HandlesAttributedToolCallTagWithParameters()
+    {
+        // Shape observed leaking 15KB of HTML as visible text in a real long-running session.
+        const string payload = """
+            先重写文件：
+
+            <tool_call name="Write">
+            <parameter name="file_path">/tmp/whack_a_mole.html</parameter>
+            <parameter name="content"><!DOCTYPE html>
+            <html lang="zh"><body>hi</body></html></parameter>
+            </tool_call>
+            """;
+
+        var blocks = TraeToolProtocol.Parse(payload);
+
+        var start = blocks.OfType<TraeToolUseStartBlock>().Single();
+        start.Name.Should().Be("Write");
+        var input = JsonNode.Parse(blocks.OfType<TraeToolInputDeltaBlock>().Single().PartialJson)!.AsObject();
+        input["file_path"]!.ToString().Should().Be("/tmp/whack_a_mole.html");
+        input["content"]!.ToString().Should().Contain("<!DOCTYPE html>");
+        blocks.OfType<TraeToolUseEndBlock>().Should().HaveCount(1);
+
+        string visible = string.Concat(blocks.OfType<TraeTextBlock>().Select(block => block.Text));
+        visible.Should().NotContain("<tool_call");
+        visible.Should().NotContain("<parameter");
+        visible.Should().NotContain("<!DOCTYPE html>");
+    }
+
+    [TestMethod]
+    public void Parse_HandlesAttributedToolCallTagWithJsonBody()
+    {
+        const string payload = """<tool_call name="Read">{"file_path":"/tmp/a.txt"}</tool_call>""";
+
+        var blocks = TraeToolProtocol.Parse(payload);
+
+        blocks.OfType<TraeToolUseStartBlock>().Single().Name.Should().Be("Read");
+        JsonNode.Parse(blocks.OfType<TraeToolInputDeltaBlock>().Single().PartialJson)!
+            .AsObject()["file_path"]!.ToString().Should().Be("/tmp/a.txt");
+        string.Concat(blocks.OfType<TraeTextBlock>().Select(b => b.Text)).Should().NotContain("tool_call");
+    }
+
+    [TestMethod]
+    public void StreamParser_DoesNotLeakPartialAttributedToolCallTag()
+    {
+        var parser = new TraeToolProtocol.StreamParser(streamToolCalls: true);
+
+        var emitted = parser.Push("写入文件：\n<tool_call na").ToList();
+
+        string visible = string.Concat(emitted.OfType<TraeTextBlock>().Select(block => block.Text));
+        visible.Should().NotContain("<tool_call");
+    }
+
+    [TestMethod]
+    public void StreamParser_AssemblesValidJsonForBareToolCallWithMultilineContent()
+    {
+        // Exact shape emitted by qwen3.8-max for a Write call, including the newline before </tool_call>.
+        const string payload = "<tool_call>{\"name\":\"Write\",\"arguments\":{\"file_path\":\"/tmp/mini.html\",\"content\":\"<!DOCTYPE html>\\n<html lang=\\\"zh\\\">\\n<style>\\nbody { color: #333; }\\n</style>\\n</html>\\n\"}}\n</tool_call>";
+        var parser = new TraeToolProtocol.StreamParser(streamToolCalls: true);
+
+        var blocks = new List<TraeOutputBlock>();
+        for (int offset = 0; offset < payload.Length; offset += 17)
+            blocks.AddRange(parser.Push(payload.Substring(offset, Math.Min(17, payload.Length - offset))));
+        blocks.AddRange(parser.Complete());
+
+        blocks.OfType<TraeToolUseStartBlock>().Single().Name.Should().Be("Write");
+        string assembled = string.Concat(blocks.OfType<TraeToolInputDeltaBlock>().Select(b => b.PartialJson));
+        var input = JsonNode.Parse(assembled)!.AsObject();
+        input["file_path"]!.ToString().Should().Be("/tmp/mini.html");
+        input["content"]!.ToString().Should().Contain("<!DOCTYPE html>");
+        blocks.OfType<TraeToolUseEndBlock>().Should().HaveCount(1);
+    }
+
+    [TestMethod]
+    public void StreamParser_AssemblesValidJsonWhenClosingBracesArriveBeforeCloseTag()
+    {
+        // Upstream SSE often ends one delta right after the JSON and sends </tool_call> in the next.
+        var parser = new TraeToolProtocol.StreamParser(streamToolCalls: true);
+        var blocks = new List<TraeOutputBlock>();
+
+        blocks.AddRange(parser.Push("""<tool_call>{"name":"Write","arguments":{"file_path":"/tmp/mini.html","content":"hi"}}"""));
+        blocks.AddRange(parser.Push("\n</tool_call>"));
+        blocks.AddRange(parser.Complete());
+
+        string assembled = string.Concat(blocks.OfType<TraeToolInputDeltaBlock>().Select(b => b.PartialJson));
+        var input = JsonNode.Parse(assembled)!.AsObject();
+        input["file_path"]!.ToString().Should().Be("/tmp/mini.html");
+        input["content"]!.ToString().Should().Be("hi");
+    }
+
+    [TestMethod]
+    public void BuildSystemPrompt_DocumentsRawParameterFormForLongValues()
+    {
+        var tools = new JsonArray(new JsonObject
+        {
+            ["name"] = "Write",
+            ["input_schema"] = new JsonObject { ["required"] = new JsonArray("file_path", "content") }
+        });
+
+        string prompt = TraeToolProtocol.BuildSystemPrompt(null, tools);
+
+        prompt.Should().Contain("""<tool_call>{"name":"tool_name","arguments":{"parameter":"value"}}</tool_call>""");
+        prompt.Should().Contain("""<tool_call name="tool_name"><parameter name="parameter">raw value</parameter></tool_call>""");
+    }
 }
