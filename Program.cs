@@ -389,7 +389,9 @@ app.MapPost("/v1/messages", async (HttpContext ctx) =>
     var body = JsonNode.Parse(await new StreamReader(ctx.Request.Body).ReadToEndAsync(ct))!.AsObject();
     string? requestedModel = (string?)body["model"];
     bool stream = body["stream"] is JsonValue sv && sv.TryGetValue<bool>(out var sb) && sb;
-    var messages = ConvertAnthropicMessages(body);
+    var tools = body["tools"] as JsonArray;
+    bool thinkingEnabled = string.Equals((string?)body["thinking"]?["type"], "enabled", StringComparison.OrdinalIgnoreCase);
+    var messages = ConvertAnthropicMessages(body, thinkingEnabled);
     if (messages.Count == 0)
         return Results.BadRequest(new { type = "error", error = new { message = "messages is required", type = "invalid_request_error" } });
 
@@ -402,10 +404,10 @@ app.MapPost("/v1/messages", async (HttpContext ctx) =>
     if (stream)
     {
         ctx.Response.ContentType = "text/event-stream";
-        await WriteAnthropicStream(ctx.Response.Body, upstream, model, ct);
+        await WriteAnthropicStream(ctx.Response.Body, upstream, model, tools, thinkingEnabled, ct);
         return Results.Empty;
     }
-    return Results.Json(await CollectAnthropic(upstream, model, ct));
+    return Results.Json(await CollectAnthropic(upstream, model, tools, thinkingEnabled, ct));
 });
 
 app.MapGet("/admin/api/accounts", () => Results.Json(new
@@ -635,14 +637,14 @@ List<(string role, string text)> ConvertOpenAIMessages(JsonArray? arr)
     return result;
 }
 
-List<(string role, string text)> ConvertAnthropicMessages(JsonObject body)
+List<(string role, string text)> ConvertAnthropicMessages(JsonObject body, bool thinkingEnabled)
 {
     var result = new List<(string, string)>();
     var tools = body["tools"] as JsonArray;
     JsonNode? toolChoice = body["tool_choice"];
     if (TraeToolProtocol.ShouldForceToolUse(body["messages"] as JsonArray, tools, toolChoice))
         toolChoice = new JsonObject { ["type"] = "any" };
-    string system = TraeToolProtocol.BuildSystemPrompt(body["system"], tools, toolChoice);
+    string system = TraeToolProtocol.BuildSystemPrompt(body["system"], tools, toolChoice, thinkingEnabled);
     if (!string.IsNullOrEmpty(system)) result.Add(("system", system));
     foreach (var m in body["messages"]?.AsArray() ?? new JsonArray())
     {
@@ -825,17 +827,25 @@ async Task WriteOpenAIStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstream, 
     }
 }
 
-async Task<JsonObject> CollectAnthropic(IAsyncEnumerable<TraeSseEvent> upstream, string model, CancellationToken ct)
+async Task<JsonObject> CollectAnthropic(
+    IAsyncEnumerable<TraeSseEvent> upstream,
+    string model,
+    JsonArray? tools,
+    bool thinkingEnabled,
+    CancellationToken ct)
 {
     var result = await TraeChatResult.CollectAsync(upstream, ct);
     var content = new JsonArray();
     bool hasToolUse = false;
+    bool hasNativeReasoning = thinkingEnabled && !string.IsNullOrWhiteSpace(result.Reasoning);
+    if (hasNativeReasoning)
+        content.Add(new JsonObject { ["type"] = "thinking", ["thinking"] = result.Reasoning });
     var thinking = new StringBuilder();
     foreach (TraeOutputBlock block in TraeToolProtocol.Parse(result.Text))
     {
-        if (block is TraeThinkingDeltaBlock thinkingDelta)
+        if (block is TraeThinkingDeltaBlock thinkingDelta && !hasNativeReasoning)
             thinking.Append(thinkingDelta.Text);
-        else if (block is TraeThinkingEndBlock)
+        else if (block is TraeThinkingEndBlock && !hasNativeReasoning)
         {
             if (thinking.Length > 0)
                 content.Add(new JsonObject
@@ -848,6 +858,15 @@ async Task<JsonObject> CollectAnthropic(IAsyncEnumerable<TraeSseEvent> upstream,
             content.Add(new JsonObject { ["type"] = "text", ["text"] = textBlock.Text });
         else if (block is TraeToolUseBlock toolUse)
         {
+            if (!TraeToolProtocol.TryValidateToolUse(toolUse, tools, out string validationError))
+            {
+                content.Add(new JsonObject
+                {
+                    ["type"] = "text",
+                    ["text"] = InvalidToolCallMessage(toolUse.Name, validationError)
+                });
+                continue;
+            }
             hasToolUse = true;
             content.Add(new JsonObject
             {
@@ -871,7 +890,12 @@ async Task<JsonObject> CollectAnthropic(IAsyncEnumerable<TraeSseEvent> upstream,
 }
 
 async Task WriteAnthropicStream(
-    Stream w, IAsyncEnumerable<TraeSseEvent> upstream, string model, CancellationToken ct)
+    Stream w,
+    IAsyncEnumerable<TraeSseEvent> upstream,
+    string model,
+    JsonArray? tools,
+    bool thinkingEnabled,
+    CancellationToken ct)
 {
     string msgId = $"msg_{Guid.NewGuid():N}";
     bool messageStarted = false;
@@ -911,6 +935,10 @@ async Task WriteAnthropicStream(
     int outputTokens = 0;
     string finishReason = "stop";
     var toolParser = new TraeToolProtocol.StreamParser(streamToolCalls: true);
+    string? pendingToolId = null;
+    string? pendingToolName = null;
+    var pendingToolInput = new StringBuilder();
+    bool sawNativeReasoning = false;
 
     async Task CloseBlock()
     {
@@ -946,6 +974,11 @@ async Task WriteAnthropicStream(
         }
         else if (block is TraeToolUseBlock toolUse)
         {
+            if (!TraeToolProtocol.TryValidateToolUse(toolUse, tools, out string validationError))
+            {
+                await WriteBlock(new TraeTextBlock(InvalidToolCallMessage(toolUse.Name, validationError)));
+                return;
+            }
             await StartMessage();
             await CloseBlock();
             sawToolUse = true;
@@ -971,38 +1004,33 @@ async Task WriteAnthropicStream(
         }
         else if (block is TraeToolUseStartBlock toolStart)
         {
-            await StartMessage();
-            await CloseBlock();
-            sawToolUse = true;
-            blockIndex++;
-            blockOpen = true;
-            blockType = "tool_use";
-            await WriteEvent("content_block_start", new JsonObject
-            {
-                ["type"] = "content_block_start", ["index"] = blockIndex,
-                ["content_block"] = new JsonObject
-                {
-                    ["type"] = "tool_use", ["id"] = toolStart.Id,
-                    ["name"] = toolStart.Name, ["input"] = new JsonObject()
-                }
-            });
+            pendingToolId = toolStart.Id;
+            pendingToolName = toolStart.Name;
+            pendingToolInput.Clear();
         }
-        else if (block is TraeToolInputDeltaBlock toolDelta && blockType == "tool_use")
+        else if (block is TraeToolInputDeltaBlock toolDelta && pendingToolName is not null)
         {
-            await WriteEvent("content_block_delta", new JsonObject
-            {
-                ["type"] = "content_block_delta", ["index"] = blockIndex,
-                ["delta"] = new JsonObject
-                {
-                    ["type"] = "input_json_delta", ["partial_json"] = toolDelta.PartialJson
-                }
-            });
+            pendingToolInput.Append(toolDelta.PartialJson);
         }
-        else if (block is TraeToolUseEndBlock && blockType == "tool_use")
+        else if (block is TraeToolUseEndBlock && pendingToolName is not null)
         {
-            await CloseBlock();
+            string id = pendingToolId ?? $"toolu_{Guid.NewGuid():N}";
+            string name = pendingToolName;
+            string serializedInput = pendingToolInput.ToString();
+            pendingToolId = null;
+            pendingToolName = null;
+            pendingToolInput.Clear();
+
+            JsonObject input;
+            try { input = JsonNode.Parse(serializedInput) as JsonObject ?? new JsonObject(); }
+            catch (JsonException)
+            {
+                await WriteBlock(new TraeTextBlock(InvalidToolCallMessage(name, "arguments are not valid JSON")));
+                return;
+            }
+            await WriteBlock(new TraeToolUseBlock(id, name, input));
         }
-        else if (block is TraeThinkingStartBlock)
+        else if (block is TraeThinkingStartBlock && !sawNativeReasoning)
         {
             await StartMessage();
             await CloseBlock();
@@ -1015,7 +1043,7 @@ async Task WriteAnthropicStream(
                 ["content_block"] = new JsonObject { ["type"] = "thinking", ["thinking"] = "" }
             });
         }
-        else if (block is TraeThinkingDeltaBlock thinkingDelta && blockType == "thinking")
+        else if (block is TraeThinkingDeltaBlock thinkingDelta && blockType == "thinking" && !sawNativeReasoning)
         {
             if (string.IsNullOrEmpty(thinkingDelta.Text)) return;
             await WriteEvent("content_block_delta", new JsonObject
@@ -1024,7 +1052,7 @@ async Task WriteAnthropicStream(
                 ["delta"] = new JsonObject { ["type"] = "thinking_delta", ["thinking"] = thinkingDelta.Text }
             });
         }
-        else if (block is TraeThinkingEndBlock && blockType == "thinking")
+        else if (block is TraeThinkingEndBlock && blockType == "thinking" && !sawNativeReasoning)
         {
             await CloseBlock();
         }
@@ -1042,6 +1070,30 @@ async Task WriteAnthropicStream(
             var j = JsonNode.Parse(ev.Data) as JsonObject;
             if (ev.Event == "output" && j != null)
             {
+                string? reasoning = thinkingEnabled ? (string?)j["reasoning_content"] : null;
+                if (!string.IsNullOrEmpty(reasoning))
+                {
+                    sawUpstreamContent = true;
+                    sawNativeReasoning = true;
+                    await StartMessage();
+                    if (blockType != "thinking")
+                    {
+                        await CloseBlock();
+                        blockIndex++;
+                        blockOpen = true;
+                        blockType = "thinking";
+                        await WriteEvent("content_block_start", new JsonObject
+                        {
+                            ["type"] = "content_block_start", ["index"] = blockIndex,
+                            ["content_block"] = new JsonObject { ["type"] = "thinking", ["thinking"] = "" }
+                        });
+                    }
+                    await WriteEvent("content_block_delta", new JsonObject
+                    {
+                        ["type"] = "content_block_delta", ["index"] = blockIndex,
+                        ["delta"] = new JsonObject { ["type"] = "thinking_delta", ["thinking"] = reasoning }
+                    });
+                }
                 string? text = (string?)j["response"];
                 if (!string.IsNullOrEmpty(text))
                 {
@@ -1094,6 +1146,9 @@ async Task WriteAnthropicStream(
         });
     }
 }
+
+string InvalidToolCallMessage(string toolName, string error) =>
+    $"The tool call '{toolName}' was not executed because the model returned invalid arguments ({error}). Please retry the request.";
 
 List<(string role, string text)> ConvertResponsesInput(JsonNode? input) => input switch
 {

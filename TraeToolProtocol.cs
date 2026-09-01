@@ -62,11 +62,22 @@ public static class TraeToolProtocol
         @"\b(file|code|project|workspace|app|application|page|website|script|game|component|endpoint|command)\b|\.[a-z0-9]{1,10}\b",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
-    public static string BuildSystemPrompt(JsonNode? system, JsonArray? tools, JsonNode? toolChoice = null)
+    public static string BuildSystemPrompt(
+        JsonNode? system,
+        JsonArray? tools,
+        JsonNode? toolChoice = null,
+        bool thinkingEnabled = false)
     {
         var sections = new List<string>();
         string systemText = ContentText(system);
         if (!string.IsNullOrWhiteSpace(systemText)) sections.Add(systemText);
+
+        if (thinkingEnabled)
+        {
+            sections.Add("""
+    You MUST begin every response with exactly one non-empty <thinking>...</thinking> block containing a brief analysis summary, even for simple requests. The <thinking> opening tag MUST be the first output token. Only after the closing </thinking> tag may you emit the user-visible answer or a tool call. Do not place user-visible prose, Markdown, code, or tool calls inside that block.
+""");
+        }
 
         string choiceType = (string?)toolChoice?["type"] ?? "auto";
         if (tools is { Count: > 0 } && choiceType != "none")
@@ -82,12 +93,47 @@ public static class TraeToolProtocol
 You have access to the tools described below. When a tool is needed, output exactly one JSON object inside these tags and do not describe the call as prose.
 The object keys MUST be in this order: name first, arguments second:
 <tool_call>{"name":"tool_name","arguments":{"parameter":"value"}}</tool_call>
+Every property listed in the tool's input_schema.required array MUST be present and non-empty. Never emit an empty arguments object when required properties exist.
 You may emit multiple tool_call blocks when calls can run in parallel. Tool definitions:
 """ + "\n" + tools.ToJsonString());
+            sections.Add("Use Markdown for all user-visible prose. Put any code shown to the user in fenced code blocks with a language identifier. Tool-call JSON is not user-visible prose and must not be wrapped in a Markdown fence.");
         }
 
         return string.Join("\n\n", sections);
     }
+
+    public static bool TryValidateToolUse(TraeToolUseBlock toolUse, JsonArray? tools, out string error)
+    {
+        error = "";
+        if (tools is not { Count: > 0 }) return true;
+
+        JsonObject? definition = tools
+            .OfType<JsonObject>()
+            .FirstOrDefault(tool => string.Equals((string?)tool["name"], toolUse.Name, StringComparison.Ordinal));
+        if (definition is null)
+        {
+            error = $"unknown tool: {toolUse.Name}";
+            return false;
+        }
+
+        if (definition["input_schema"]?["required"] is not JsonArray required) return true;
+        string[] missing = required
+            .Select(node => (string?)node)
+            .Where(name => !string.IsNullOrWhiteSpace(name) && IsMissing(toolUse.Input[name!]))
+            .Select(name => name!)
+            .ToArray();
+        if (missing.Length == 0) return true;
+
+        error = $"missing required properties: {string.Join(", ", missing)}";
+        return false;
+    }
+
+    private static bool IsMissing(JsonNode? value) => value switch
+    {
+        null => true,
+        JsonValue jsonValue when jsonValue.TryGetValue<string>(out string? text) => string.IsNullOrWhiteSpace(text),
+        _ => false
+    };
 
     public static bool ShouldForceToolUse(JsonArray? messages, JsonArray? tools, JsonNode? toolChoice)
     {

@@ -40,6 +40,51 @@ public sealed class TraeToolProtocolTests
     }
 
     [TestMethod]
+    public void BuildSystemPrompt_RequestsTaggedThinkingAndMarkdownWhenEnabled()
+    {
+        string prompt = TraeToolProtocol.BuildSystemPrompt(
+            new JsonArray(new JsonObject { ["type"] = "text", ["text"] = "system rules" }),
+            new JsonArray(new JsonObject { ["name"] = "run_code" }),
+            thinkingEnabled: true);
+
+        prompt.Should().Contain("<thinking>").And.Contain("</thinking>");
+        prompt.Should().Contain("MUST begin every response").And.Contain("non-empty");
+        prompt.Should().Contain("first output token");
+        prompt.Should().Contain("Markdown").And.Contain("fenced code blocks");
+    }
+
+    [TestMethod]
+    public void ValidateToolUse_RejectsMissingRequiredArguments()
+    {
+        var tools = new JsonArray(new JsonObject
+        {
+            ["name"] = "run_code",
+            ["input_schema"] = new JsonObject
+            {
+                ["type"] = "object",
+                ["required"] = new JsonArray("code", "description")
+            }
+        });
+        var toolUse = new TraeToolUseBlock("toolu_1", "run_code", new JsonObject());
+
+        TraeToolProtocol.TryValidateToolUse(toolUse, tools, out string error).Should().BeFalse();
+        error.Should().Contain("code").And.Contain("description");
+    }
+
+    [TestMethod]
+    public void ValidateToolUse_AllowsToolsWithoutRequiredArguments()
+    {
+        var tools = new JsonArray(new JsonObject
+        {
+            ["name"] = "list_files",
+            ["input_schema"] = new JsonObject { ["type"] = "object" }
+        });
+        var toolUse = new TraeToolUseBlock("toolu_1", "list_files", new JsonObject());
+
+        TraeToolProtocol.TryValidateToolUse(toolUse, tools, out _).Should().BeTrue();
+    }
+
+    [TestMethod]
     public void ShouldForceToolUse_RequiresExecutionForWorkspaceActionOnly()
     {
         var tools = new JsonArray(new JsonObject { ["name"] = "write_file" });

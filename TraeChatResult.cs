@@ -10,11 +10,14 @@ public sealed record TraeChatResult(
     int TotalTokens,
     string FinishReason)
 {
+    public string Reasoning { get; init; } = "";
+
     public static async Task<TraeChatResult> CollectAsync(
         IAsyncEnumerable<TraeSseEvent> upstream,
         CancellationToken cancellationToken = default)
     {
         var text = new StringBuilder();
+        var reasoning = new StringBuilder();
         int promptTokens = 0;
         int completionTokens = 0;
         int totalTokens = 0;
@@ -30,6 +33,7 @@ public sealed record TraeChatResult(
             {
                 case "output":
                     text.Append((string?)payload?["response"] ?? "");
+                    reasoning.Append((string?)payload?["reasoning_content"] ?? "");
                     if (payload?["finish_reason"] is JsonValue outputReason &&
                         outputReason.TryGetValue<string>(out var parsedOutputReason))
                         finishReason = parsedOutputReason;
@@ -63,6 +67,9 @@ public sealed record TraeChatResult(
             promptTokens,
             completionTokens,
             totalTokens,
-            finishReason);
+            finishReason)
+        {
+            Reasoning = reasoning.ToString()
+        };
     }
 }

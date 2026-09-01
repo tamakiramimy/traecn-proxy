@@ -77,6 +77,21 @@ public sealed class TraeReliabilityTests
     }
 
     [TestMethod]
+    public async Task ChatResult_CollectsReasoningSeparatelyFromVisibleText()
+    {
+        var events = Events(
+            new TraeSseEvent("metadata", "{}"),
+            new TraeSseEvent("output", "{\"reasoning_content\":\"first \"}"),
+            new TraeSseEvent("output", "{\"reasoning_content\":\"second\",\"response\":\"answer\"}"),
+            new TraeSseEvent("done", "{\"finish_reason\":\"stop\"}"));
+
+        var result = await TraeChatResult.CollectAsync(events);
+
+        result.Text.Should().Be("answer");
+        result.Reasoning.Should().Be("first second");
+    }
+
+    [TestMethod]
     public async Task ChatResult_RejectsCompletedStreamWithoutContent()
     {
         var events = Events(

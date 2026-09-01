@@ -8,12 +8,13 @@
 
 - 对话走企业控制面 `chat_v3` 通道直连上游，**精确选模有效**：代理会校验上游回传的实际模型 metadata，不一致时返回 `model_selection_mismatch`，不会静默回退到其他模型。
 - 支持多账号池（网页登录逐个添加）、会话粘滞、优先级/并发均衡调度、Token 自动刷新。
-- Anthropic Messages 已支持流式与非流式输出、thinking 内容、`tool_use` / `tool_result`，并通过 Claude Desktop 完成真实工具调用与文件读写验证。
+- Anthropic Messages 已支持流式与非流式输出、上游 `reasoning_content` 到 thinking block 的映射，以及 `tool_use` / `tool_result`；已完成 Qwen 3.8 的 thinking、Markdown 代码块和单次工具调用 API 回归。
 - 已在 Linux 容器中实测可用：模型目录、精确选模、OpenAI / Anthropic 端点、流式输出、管理端逐模型测试。
 
 ## 能力与限制
 
 - OpenAI Responses 目前具备基础文本转发与流式封装，尚待 Codex 客户端端到端验证。
+- Claude Desktop 与其他自动执行工具的客户端仍需进行受控长会话回归；代理会拒绝缺少 `input_schema.required` 参数的工具调用，避免将无效 `tool_use` 交给客户端反复执行。
 - 复杂多模态输入与完整 Anthropic 交错消息规则尚未覆盖。
 - SOLO / 消费版服务面（`solo_work_lite`）按 `config_name` 选模，与企业面的 `__dev` / `__max` ID 不通用，尚未做完整回归。
 - 账号类型目前只支持显式声明与按 `Upstream:ChatApiHost` 推断，尚未实现按租户信息推断或端点探测兜底。
