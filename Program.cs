@@ -19,7 +19,7 @@ int port = settings.Server.Port;
 string listen = settings.Server.Listen;
 string? gatewayKey = Environment.GetEnvironmentVariable("TRANCN_API_KEY") ?? EmptyToNull(settings.Security.ApiKey);
 string? adminKey = Environment.GetEnvironmentVariable("TRANCN_ADMIN_KEY") ?? EmptyToNull(settings.Security.AdminKey);
-string testModel = TraeClient.DefaultChatModel;
+string? testModel = null;
 string accountAlias = "default";
 string? dataDirectory = EmptyToNull(settings.Accounts.DataDirectory);
 string? importPath = null;
@@ -79,7 +79,11 @@ catch (InvalidOperationException ex)
 using (instanceLock)
 {
 var accountStore = new TraeAccountStore(dataDirectory);
-var accountManager = new MultiAccountManager(accountStore, chatApiHost);
+var upstreamOptions = settings.Upstream.ToOptions(chatApiHost);
+var defaultAccountKind = Enum.TryParse<TraeAccountKind>(settings.Upstream.DefaultAccountKind, ignoreCase: true, out var configuredKind)
+    ? configuredKind
+    : TraeAccountKind.Auto;
+var accountManager = new MultiAccountManager(accountStore, upstreamOptions);
 var oauthLogins = new TraeOAuthLoginManager();
 if (!string.IsNullOrWhiteSpace(importPath))
 {
@@ -97,12 +101,18 @@ if (forceLogin)
         Alias = accountAlias,
         Auth = auth,
         DeviceId = deviceId,
-        MachineId = machineId
+        MachineId = machineId,
+        Kind = defaultAccountKind
     });
     Console.WriteLine($"已从 IDE 导入账号: {accountAlias}");
 }
 
-if (webLogin || accountManager.Accounts.Count == 0)
+// CLI 授权回调只能落到本机 127.0.0.1，容器等无头部署改由管理端完成登录。
+bool deferLoginToAdmin = accountManager.Accounts.Count == 0
+    && !webLogin && !testMode && !listChatModels
+    && !string.IsNullOrEmpty(adminKey);
+
+if (webLogin || (accountManager.Accounts.Count == 0 && !deferLoginToAdmin))
 {
     var (deviceId, machineId) = TraeAuthStore.ReadDeviceIds();
     var bootstrapClient = new TraeClient(new TraeAuthData(), deviceId, machineId);
@@ -112,7 +122,8 @@ if (webLogin || accountManager.Accounts.Count == 0)
         Alias = accountAlias,
         Auth = auth,
         DeviceId = deviceId,
-        MachineId = machineId
+        MachineId = machineId,
+        Kind = defaultAccountKind
     });
     Console.WriteLine($"已添加网页授权账号: {accountAlias}");
 }
@@ -120,11 +131,13 @@ if (webLogin || accountManager.Accounts.Count == 0)
 if (listAccounts)
 {
     foreach (var account in accountManager.Accounts.OrderBy(x => x.Alias))
-        Console.WriteLine($"{account.Alias,-16} {(account.Enabled ? "enabled" : "disabled"),-8} {account.Auth.Username ?? account.Auth.UserId}  expires={account.Auth.ExpiredAt:yyyy-MM-dd HH:mm}Z");
+        Console.WriteLine($"{account.Alias,-16} {(account.Enabled ? "enabled" : "disabled"),-8} {account.Kind.ToString().ToLowerInvariant(),-10} {account.Auth.Username ?? account.Auth.UserId}  expires={account.Auth.ExpiredAt:yyyy-MM-dd HH:mm}Z");
     return 0;
 }
 
 Console.WriteLine($"账号池就绪: {accountManager.Accounts.Count} 个账号");
+if (deferLoginToAdmin)
+    Console.WriteLine("尚未配置账号，请打开 /admin 完成 Trae 网页登录后再调用 /v1 接口。");
 
 if (listChatModels)
 {
@@ -139,9 +152,10 @@ if (listChatModels)
 // ---------- 2. 自测模式 ----------
 if (testMode)
 {
-    Console.WriteLine($"--- 自测:向 {testModel} 发送消息 ---");
     var sb = new StringBuilder();
     using var lease = accountManager.AcquireByAlias(accountAlias);
+    testModel ??= lease.Client.DefaultModelId;
+    Console.WriteLine($"--- 自测:向 {testModel} 发送消息 ---");
     try
     {
         var testDescriptor = await lease.Client.ResolveModelAsync(testModel);
@@ -321,13 +335,14 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx) =>
 {
     var ct = ctx.RequestAborted;
     var body = JsonNode.Parse(await new StreamReader(ctx.Request.Body).ReadToEndAsync(ct))!.AsObject();
-    string model = (string?)body["model"] ?? TraeClient.DefaultChatModel;
+    string? requestedModel = (string?)body["model"];
     bool stream = body["stream"] is JsonValue sv && sv.TryGetValue<bool>(out var sb) && sb;
     var messages = ConvertOpenAIMessages(body["messages"]?.AsArray());
     if (messages.Count == 0)
         return Results.BadRequest(new { error = new { message = "messages is required", type = "invalid_request_error" } });
 
     using var lease = await accountManager.AcquireAsync(SessionKey(ctx, body), ct);
+    string model = requestedModel ?? lease.Client.DefaultModelId;
     TraeModelDescriptor descriptor;
     try { descriptor = await lease.Client.ResolveModelAsync(model, ct); }
     catch (TraeModelNotFoundException) { return UnsupportedModel(model); }
@@ -346,13 +361,14 @@ app.MapPost("/v1/responses", async (HttpContext ctx) =>
 {
     var ct = ctx.RequestAborted;
     var body = JsonNode.Parse(await new StreamReader(ctx.Request.Body).ReadToEndAsync(ct))!.AsObject();
-    string model = (string?)body["model"] ?? TraeClient.DefaultChatModel;
+    string? requestedModel = (string?)body["model"];
     bool stream = body["stream"] is JsonValue sv && sv.TryGetValue<bool>(out var sb) && sb;
     var messages = ConvertResponsesInput(body["input"]);
     if (messages.Count == 0)
         return Results.BadRequest(new { error = new { message = "input is required", type = "invalid_request_error" } });
 
     using var lease = await accountManager.AcquireAsync(SessionKey(ctx, body), ct);
+    string model = requestedModel ?? lease.Client.DefaultModelId;
     TraeModelDescriptor descriptor;
     try { descriptor = await lease.Client.ResolveModelAsync(model, ct); }
     catch (TraeModelNotFoundException) { return UnsupportedModel(model); }
@@ -371,13 +387,14 @@ app.MapPost("/v1/messages", async (HttpContext ctx) =>
 {
     var ct = ctx.RequestAborted;
     var body = JsonNode.Parse(await new StreamReader(ctx.Request.Body).ReadToEndAsync(ct))!.AsObject();
-    string model = (string?)body["model"] ?? TraeClient.DefaultChatModel;
+    string? requestedModel = (string?)body["model"];
     bool stream = body["stream"] is JsonValue sv && sv.TryGetValue<bool>(out var sb) && sb;
     var messages = ConvertAnthropicMessages(body);
     if (messages.Count == 0)
         return Results.BadRequest(new { type = "error", error = new { message = "messages is required", type = "invalid_request_error" } });
 
     using var lease = await accountManager.AcquireAsync(SessionKey(ctx, body), ct);
+    string model = requestedModel ?? lease.Client.DefaultModelId;
     TraeModelDescriptor descriptor;
     try { descriptor = await lease.Client.ResolveModelAsync(model, ct); }
     catch (TraeModelNotFoundException) { return UnsupportedModel(model); }
@@ -397,6 +414,7 @@ app.MapGet("/admin/api/accounts", () => Results.Json(new
     {
         alias = x.Alias,
         enabled = x.Enabled,
+        kind = x.Kind.ToString().ToLowerInvariant(),
         priority = x.Priority,
         max_concurrency = x.MaxConcurrency,
         user = x.Auth.Username ?? x.Auth.UserId,
@@ -462,46 +480,51 @@ app.MapGet("/admin/api/accounts/{alias}/models", async (string alias, Cancellati
     {
         using var lease = accountManager.AcquireByAlias(alias);
         var catalog = await lease.Client.GetModelCatalogAsync(ct: ct);
-        return Results.Json(new JsonObject
+        return Results.Json(new
         {
-            ["models"] = new JsonArray(catalog.Models.Select(model => (JsonNode)new JsonObject
+            models = catalog.Models.Select(model => new
             {
-                ["id"] = model.Id,
-                ["display_name"] = model.DisplayName,
-                ["config_name"] = model.ConfigName
-            }).ToArray())
-        });
-    }
-    catch (Exception ex) { return Results.NotFound(new { error = ex.Message }); }
-});
-// 让模型回述自己的名字，用于识别上游静默降级到别的模型。
-app.MapPost("/admin/api/accounts/{alias}/models/test", async (string alias, HttpContext ctx, CancellationToken ct) =>
-{
-    try
-    {
-        var body = JsonNode.Parse(await new StreamReader(ctx.Request.Body).ReadToEndAsync(ct)) as JsonObject;
-        string requested = (string?)body?["model"] ?? "";
-        if (string.IsNullOrWhiteSpace(requested))
-            return Results.BadRequest(new { error = "model is required" });
-
-        using var lease = accountManager.AcquireByAlias(alias);
-        var descriptor = await lease.Client.ResolveModelAsync(requested, ct);
-        var reply = new StringBuilder();
-        string? actualModel = null;
-        await foreach (var ev in lease.Client.ChatStreamAsync(
-            new[] { ("user", $"请回复{descriptor.ConfigName}") }, descriptor, ct))
-        {
-            var payload = JsonNode.Parse(ev.Data) as JsonObject;
-            if (ev.Event == "metadata") actualModel = (string?)payload?["model"] ?? actualModel;
-            else if (ev.Event == "output") reply.Append((string?)payload?["response"] ?? "");
-        }
-        return Results.Json(new JsonObject
-        {
-            ["actual_model"] = actualModel ?? descriptor.Id,
-            ["reply"] = reply.ToString().Trim()
+                id = model.Id,
+                display_name = model.DisplayName,
+                config_name = model.ConfigName,
+                variant = model.Variant.ToString().ToLowerInvariant()
+            })
         });
     }
     catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+});
+app.MapPost("/admin/api/accounts/{alias}/models/test", async (string alias, HttpContext ctx) =>
+{
+    var ct = ctx.RequestAborted;
+    var body = JsonNode.Parse(await new StreamReader(ctx.Request.Body).ReadToEndAsync(ct))?.AsObject();
+    string requested = (string?)body?["model"] ?? "";
+    if (string.IsNullOrWhiteSpace(requested))
+        return Results.BadRequest(new { error = "model is required" });
+
+    try
+    {
+        using var lease = accountManager.AcquireByAlias(alias);
+        var descriptor = await lease.Client.ResolveModelAsync(requested, ct);
+        string prompt = $"请回复{descriptor.ConfigName}";
+        var reply = new StringBuilder();
+        string? actualModel = null;
+        await foreach (var ev in lease.Client.ChatStreamAsync([("user", prompt)], descriptor, ct))
+        {
+            var payload = JsonNode.Parse(ev.Data) as JsonObject;
+            if (ev.Event == "metadata") actualModel = (string?)payload?["model"];
+            else if (ev.Event == "output") reply.Append((string?)payload?["response"] ?? "");
+        }
+        return Results.Json(new
+        {
+            ok = true,
+            model = descriptor.Id,
+            actual_model = actualModel,
+            prompt,
+            reply = reply.ToString().Trim()
+        });
+    }
+    catch (TraeModelNotFoundException ex) { return Results.BadRequest(new { error = ex.Message }); }
+    catch (Exception ex) { return Results.Json(new { error = ex.Message }, statusCode: 502); }
 });
 app.MapPut("/admin/api/settings", async (HttpContext ctx) =>
 {

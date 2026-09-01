@@ -1,11 +1,3 @@
-.git
-.github
-.codegraph
-.artifacts
-bin
-obj
-logs
-tests
-data
-*.user
-.DS_Store
+*
+!.artifacts/publish
+.artifacts/publish/**/*.pdb

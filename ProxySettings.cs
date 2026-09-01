@@ -51,6 +51,32 @@ public sealed class ProxySettings
     public sealed class UpstreamSettings
     {
         public string? ChatApiHost { get; set; }
+
+        /// <summary>新账号未显式声明类型时的默认服务面：auto / enterprise / solo。</summary>
+        public string? DefaultAccountKind { get; set; }
+
+        public ClientProfileSettings Enterprise { get; set; } = new();
+        public ClientProfileSettings Solo { get; set; } = new();
+
+        internal TraeUpstreamOptions ToOptions(string? chatApiHost) => new(
+            chatApiHost,
+            Enterprise.ToOverrides(),
+            Solo.ToOverrides());
+    }
+
+    /// <summary>客户端画像覆盖项，留空表示沿用内置默认值。</summary>
+    public sealed class ClientProfileSettings
+    {
+        public string? IdeVersion { get; set; }
+        public string? IdeVersionCode { get; set; }
+        public string? DeviceType { get; set; }
+        public string? OsVersion { get; set; }
+        public string? DeviceBrand { get; set; }
+
+        internal TraeClientProfileOverrides? ToOverrides() =>
+            IdeVersion is null && IdeVersionCode is null && DeviceType is null && OsVersion is null && DeviceBrand is null
+                ? null
+                : new TraeClientProfileOverrides(IdeVersion, IdeVersionCode, DeviceType, OsVersion, DeviceBrand);
     }
 
     public sealed class IdeBridgeSettings

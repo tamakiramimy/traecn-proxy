@@ -20,8 +20,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="TrancnProxy.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <None Update="appsettings.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
-    <None Update="wwwroot/**/*" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <!-- Microsoft.NET.Sdk 不会自动发布 wwwroot，管理端静态资源需显式声明 -->
+    <None Include="wwwroot/**" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

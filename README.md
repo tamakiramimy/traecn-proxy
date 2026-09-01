@@ -2,15 +2,24 @@
 
 > 非官方实验项目。将已获授权的 Trae CN 企业账号接入为基础 OpenAI / Anthropic 兼容 API。
 
-`trancn-proxy` 可独立运行，不需要安装或启动 Trae CN IDE。在管理台完成网页 OAuth 授权后，代理通过企业 `chat_v3` 通道转发文本对话请求，便于接入兼容 OpenAI 或 Anthropic API 的工具。
+`trancn-proxy` **独立运行，不需要安装或启动 Trae CN IDE**：通过网页 OAuth 授权拿到企业账号凭据后，直接以 HTTP/SSE 调用上游对话接口，对外提供 OpenAI / Anthropic 兼容 API。也可以从本机已登录的 Trae CN 导入账号。
+
+## 当前能力
+
+- 对话走企业控制面 `chat_v3` 通道直连上游，**精确选模有效**：代理会校验上游回传的实际模型 metadata，不一致时返回 `model_selection_mismatch`，不会静默回退到其他模型。
+- 支持多账号池（网页登录逐个添加）、会话粘滞、优先级/并发均衡调度、Token 自动刷新。
+- Anthropic Messages 已支持流式与非流式输出、thinking 内容、`tool_use` / `tool_result`，并通过 Claude Desktop 完成真实工具调用与文件读写验证。
+- 已在 Linux 容器中实测可用：模型目录、精确选模、OpenAI / Anthropic 端点、流式输出、管理端逐模型测试。
 
 ## 能力与限制
 
-- 企业账号的模型目录、精确选模、OpenAI / Anthropic 端点、流式输出和多账号管理已在 Linux 容器内通过 `chat_v3` 通道实测。
-- SOLO / 消费版服务面使用 `solo_work_lite`，其 `config_name` 与企业面的 `__dev` / `__max` 模型 ID 不通用，目前尚未完成容器内完整回归。
-- 代理会校验 TRAE 返回的实际模型 metadata。实际模型与请求 ID 不一致时返回 `model_selection_mismatch`，不会静默回退到其他模型。
-- 仅验证了基础文本对话。工具调用、复杂多模态输入、完整 Anthropic 交错消息规则及思考内容分离尚未实现。
-- 镜像默认关闭 `IdeBridge`。该功能只用于开发期协议取证，不参与容器对话链路。
+- OpenAI Responses 目前具备基础文本转发与流式封装，尚待 Codex 客户端端到端验证。
+- 复杂多模态输入与完整 Anthropic 交错消息规则尚未覆盖。
+- SOLO / 消费版服务面（`solo_work_lite`）按 `config_name` 选模，与企业面的 `__dev` / `__max` ID 不通用，尚未做完整回归。
+- 账号类型目前只支持显式声明与按 `Upstream:ChatApiHost` 推断，尚未实现按租户信息推断或端点探测兜底。
+- IDE Bridge 已不参与对话，仅保留给开发期协议取证（见下文），需要 TRAE 以 `--remote-debugging-port=9333` 启动才可用；`GET /v1/status` 的 `ide_bridge` 字段仅反映该取证通道状态。
+- macOS 与 Linux 容器已实测。Windows 发布包可用，但 Trae CN 的本地数据读取尚未完成端到端验证。
+- 本项目与 Trae、字节跳动无隶属关系。使用前请确认符合组织 IT 政策、账号授权范围与服务条款。
 
 完整的调研与协议说明见 [docs/design.md](docs/design.md)。
 
@@ -91,6 +100,7 @@ curl http://127.0.0.1:9220/v1/models \
 - `trancn-proxy-v*-osx-x64.zip`：Intel Mac
 - `trancn-proxy-v*-win-x64.zip`：Windows x64
 - `trancn-proxy-v*-win-arm64.zip`：Windows ARM64
+- `trancn-proxy-v*-linux-x64.zip` / `trancn-proxy-v*-linux-arm64.zip`：Linux
 
 解压后运行 `trancn-proxy`（Windows 为 `trancn-proxy.exe`）。macOS 首次运行如被系统拦截，可在确认来源可信后移除隔离属性：
 
@@ -99,12 +109,20 @@ xattr -dr com.apple.quarantine trancn-proxy
 ./trancn-proxy
 ```
 
-也可从源码运行，需安装 .NET 8 SDK。独立网页登录不依赖 IDE：
+首次启动没有账号时会自动打开浏览器完成 Trae CN 网页授权；也可以显式指定：
+
+```bash
+./trancn-proxy --weblogin          # 独立网页授权，不依赖 Trae CN IDE
+./trancn-proxy --login             # 从本机已登录的 Trae CN 导入账号
+```
+
+设置了 `TRANCN_ADMIN_KEY` 时，零账号也会直接启动服务，改为在 `/admin` 网页里添加账号（远程与容器部署用这种方式）。
+
+也可从源码运行，需安装 .NET 8 SDK：
 
 ```bash
 dotnet run -- --weblogin
 ```
-
 ## 配置
 
 启动目录中的 `appsettings.json` 用于服务配置，发布产物会自带不含密钥的默认文件：
@@ -134,6 +152,35 @@ dotnet run -- --weblogin
 
 `Accounts:DataDirectory` 留空时使用 `~/.config/trancn-proxy`。覆盖优先级为：命令行参数最高，其次是环境变量，最后是 `appsettings.json`。环境变量 `TRANCN_API_KEY`、`TRANCN_ADMIN_KEY`、`TRANCN_PUBLIC_BASE_URL` 分别覆盖对应配置项。
 
+`IdeBridge` 只服务于开发期协议取证，对话链路不会用到它；不做取证时可以设为 `false`（Docker 镜像内已默认关闭）。
+
+## 服务面与账号类型
+
+上游有两套不兼容的服务面，每个账号由 `accounts.json` 中的 `kind` 字段决定用哪一套：
+
+| `kind` | chat 通道 | 模型目录端点 | 模型 ID 语义 |
+| --- | --- | --- | --- |
+| `enterprise` | `chat_v3` | `/api/ide/v1/batch_get_detail_param` | `model` 与 `config_name` 分离（如 `glm-5.3__dev` / `glm-5.3`） |
+| `solo` | `solo_work_lite` | `/api/ide/v1/get_detail_param` | 两者都用 `config_name` |
+| `auto`（默认） | 按是否配置了独立 `Upstream:ChatApiHost` 推断 | | |
+
+同一个账号池里可以混用两种类型，各自使用自己的通道、目录与默认模型，互不影响。`Upstream:DefaultAccountKind` 决定新建账号的默认类型。
+
+客户端画像（版本号、设备品牌、OS 版本）已可配置，上游要求新版本时改配置即可，不必重新发版：
+
+```json
+{
+	"Upstream": {
+		"ChatApiHost": "",
+		"DefaultAccountKind": "auto",
+		"Enterprise": { "IdeVersion": "3.3.87", "IdeVersionCode": "20260806" },
+		"Solo": { "IdeVersion": "0.1.43", "IdeVersionCode": "20260716", "DeviceBrand": "83DG" }
+	}
+}
+```
+
+留空的字段沿用内置默认值；企业面的设备信息默认取本机环境，SOLO 面固定使用该服务接受的 SOLO 客户端形态。
+
 ## 命令行参数
 
 | 参数 | 说明 |
@@ -144,7 +191,7 @@ dotnet run -- --weblogin
 | `--login` | 强制从 Trae CN 本地存储重新读取授权 |
 | `--weblogin` | 使用独立网页授权，不依赖 Trae CN IDE |
 | `--test` | 发送一条真实对话自测 |
-| `--model <model>` | 配合 `--test` 指定模型，默认 `Doubao-Seed-Evolving` |
+| `--model <model>` | 配合 `--test` 指定模型，缺省时用当前账号服务面的默认模型 |
 | `--account <alias>` | 指定网页登录、IDE 导入或自测使用的账号别名，默认 `default` |
 | `--account-list` | 列出本地已保存的账号 |
 | `--account-import <file>` | 导入单个账号或账号数组 JSON 文件 |
@@ -168,11 +215,11 @@ bridge 会记录活动请求关联的 Aha `request_stream` 出入站 envelope。
 
 ## 多账号与管理端
 
-代理对外提供一个 `/v1` 入口。账号池负责模型目录、授权维护、会话粘滞和调度，实际推理由对应网页授权账号通过 `chat_v3` 通道完成。
+代理对外只提供一个 `/v1` 入口。每个请求在完整响应周期内锁定一个账号，模型目录、对话与授权维护都走该账号自己的凭据，不依赖任何 IDE 登录态。
 
-账号库位于 `accounts.json`，首次运行会自动迁移旧的 `auth.json` 为 `default` 账号。JSON 可通过 `--account-import` 或管理端导入。多账号推荐使用独立网页授权，避免与 IDE 登录态竞争 refresh token。
+账号库位于 `accounts.json`，首次运行会自动迁移旧的 `auth.json` 为 `default` 账号。JSON 可通过 `--account-import` 或管理端导入。多账号推荐使用网页授权逐个添加，避免与 IDE 登录态竞争 refresh token。
 
-设置 `TRANCN_ADMIN_KEY` 后访问 `http://127.0.0.1:9220/admin`。管理端支持账号列表、JSON 导入、启停、刷新、测试、删除、账号级最大并发和 Trae 网页登录。最大并发允许设置为 1 到 100；调度设置中的“新账号默认并发”只影响后续添加的账号，不会批量覆盖已有账号。在线降低并发不会中断正在进行的响应，只会暂时阻止新请求，直到在途请求数回落到新上限以内。远程部署网页登录时必须配置浏览器可访问的 `--public-base-url https://proxy.example.com`。
+设置 `TRANCN_ADMIN_KEY` 后访问 `http://127.0.0.1:9220/admin`。管理端支持账号列表、JSON 导入、启停、刷新、Token 校验、逐模型测试对话、删除、账号级最大并发和 Trae 网页登录。模型测试会向所选模型发送一句「请回复&lt;模型名&gt;」并回显上游实际模型，用于确认该账号在该模型上可用。最大并发允许设置为 1 到 100；调度设置中的“新账号默认并发”只影响后续添加的账号，不会批量覆盖已有账号。在线降低并发不会中断正在进行的响应，只会暂时阻止新请求，直到在途请求数回落到新上限以内。远程部署网页登录时必须配置浏览器可访问的 `--public-base-url https://proxy.example.com`。
 
 sub2api 的账户并发和 traecn-proxy 的账号最大并发是两层独立限制。生产部署时应将两者配置为一致或让 sub2api 的限制更低；修改其中一层不会自动同步另一层。
 
@@ -199,7 +246,7 @@ auth_scheme: authorization_bearer
 passthrough: enabled
 ```
 
-建议先请求 `/v1/models` 获取当前账号的精确 ID。2026-08-27 已实测：
+建议先请求 `/v1/models` 获取当前账号的精确 ID。2026-08-28 已在 Linux 容器内实测：
 
 - `glm-5.3__dev`
 - `DeepSeek-V4-Pro-Official__dev`
@@ -228,5 +275,5 @@ curl http://127.0.0.1:9220/v1/chat/completions \
 
 - 会读取、缓存并在非独立授权模式下可能回写 Trae CN 的 access token 与 refresh token。缓存文件为 `~/.config/trancn-proxy/auth.json`，非 Windows 平台会尝试设置为仅当前用户可读写。
 - 默认仅监听 `127.0.0.1`。使用 `--listen 0.0.0.0` 前必须设置 `--api-key` 或 `TRANCN_API_KEY`，并自行配置访问控制。
-- 管理端必须设置独立且强随机的 `TRANCN_ADMIN_KEY`；OAuth 回调只接受五分钟内创建的 `state`，不会接受任意回调写入账号。
+- 管理端必须设置独立且强随机的 `TRANCN_ADMIN_KEY`；OAuth 回调只接受五分钟内创建的 `login_trace_id`，不会接受任意回调写入账号。
 - 本项目与 Trae、字节跳动无隶属关系。使用前请确认符合组织 IT 政策、账号授权范围与服务条款；不要公开暴露企业账号或令牌。
