@@ -108,6 +108,20 @@ public sealed class TraeToolProtocolTests
     }
 
     [TestMethod]
+    public void StreamParser_RepairsObservedIdFirstSeparatorError()
+    {
+        var parser = new TraeToolProtocol.StreamParser(streamToolCalls: true);
+        const string output = "<tool_call>{\"id\":\"toolu_1\"][\"name\":\"Read\",\"arguments\":{\"file_path\":\"/tmp/a.txt\"}}</tool_call>";
+
+        var blocks = parser.Push(output).Concat(parser.Complete()).ToList();
+
+        var tool = blocks.OfType<TraeToolUseBlock>().Should().ContainSingle().Subject;
+        tool.Id.Should().Be("toolu_1");
+        tool.Name.Should().Be("Read");
+        tool.Input["file_path"]!.GetValue<string>().Should().Be("/tmp/a.txt");
+    }
+
+    [TestMethod]
     public void StreamParser_StreamsToolNameAndArgumentsBeforeClosingTag()
     {
         var parser = new TraeToolProtocol.StreamParser(streamToolCalls: true);
@@ -123,6 +137,34 @@ public sealed class TraeToolProtocolTests
         JsonNode.Parse(streamedJson)!["path"]!.GetValue<string>().Should().Be("index.html");
         JsonNode.Parse(streamedJson)!["content"]!.GetValue<string>().Should().Be("<html>game</html>");
         remaining.OfType<TraeToolUseEndBlock>().Should().ContainSingle();
+    }
+
+    [TestMethod]
+    public void StreamParser_StreamsBareJsonToolCall()
+    {
+        var parser = new TraeToolProtocol.StreamParser(streamToolCalls: true);
+        var blocks = new List<TraeOutputBlock>();
+
+        blocks.AddRange(parser.Push("{\"na"));
+        blocks.AddRange(parser.Push("me\":\"Bash\",\"arguments\":{\"command\":\"pwd\"}}\n"));
+        blocks.AddRange(parser.Complete());
+
+        blocks.OfType<TraeToolUseStartBlock>().Should().ContainSingle().Which.Name.Should().Be("Bash");
+        string input = string.Concat(blocks.OfType<TraeToolInputDeltaBlock>().Select(block => block.PartialJson));
+        JsonNode.Parse(input)!["command"]!.GetValue<string>().Should().Be("pwd");
+        blocks.OfType<TraeToolUseEndBlock>().Should().ContainSingle();
+        blocks.OfType<TraeTextBlock>().Should().BeEmpty();
+    }
+
+    [TestMethod]
+    public void StreamParser_KeepsOrdinaryBareJsonAsText()
+    {
+        var parser = new TraeToolProtocol.StreamParser(streamToolCalls: true);
+        var blocks = parser.Push("{\"status\":\"ok\"}").Concat(parser.Complete()).ToList();
+
+        string text = string.Concat(blocks.OfType<TraeTextBlock>().Select(block => block.Text));
+        text.Should().Be("{\"status\":\"ok\"}");
+        blocks.OfType<TraeToolUseStartBlock>().Should().BeEmpty();
     }
 
     [TestMethod]

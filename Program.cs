@@ -456,6 +456,53 @@ app.MapPost("/admin/api/accounts/{alias}/test", async (string alias, Cancellatio
     }
     catch (Exception ex) { return Results.NotFound(new { error = ex.Message }); }
 });
+app.MapGet("/admin/api/accounts/{alias}/models", async (string alias, CancellationToken ct) =>
+{
+    try
+    {
+        using var lease = accountManager.AcquireByAlias(alias);
+        var catalog = await lease.Client.GetModelCatalogAsync(ct: ct);
+        return Results.Json(new JsonObject
+        {
+            ["models"] = new JsonArray(catalog.Models.Select(model => (JsonNode)new JsonObject
+            {
+                ["id"] = model.Id,
+                ["display_name"] = model.DisplayName,
+                ["config_name"] = model.ConfigName
+            }).ToArray())
+        });
+    }
+    catch (Exception ex) { return Results.NotFound(new { error = ex.Message }); }
+});
+// 让模型回述自己的名字，用于识别上游静默降级到别的模型。
+app.MapPost("/admin/api/accounts/{alias}/models/test", async (string alias, HttpContext ctx, CancellationToken ct) =>
+{
+    try
+    {
+        var body = JsonNode.Parse(await new StreamReader(ctx.Request.Body).ReadToEndAsync(ct)) as JsonObject;
+        string requested = (string?)body?["model"] ?? "";
+        if (string.IsNullOrWhiteSpace(requested))
+            return Results.BadRequest(new { error = "model is required" });
+
+        using var lease = accountManager.AcquireByAlias(alias);
+        var descriptor = await lease.Client.ResolveModelAsync(requested, ct);
+        var reply = new StringBuilder();
+        string? actualModel = null;
+        await foreach (var ev in lease.Client.ChatStreamAsync(
+            new[] { ("user", $"请回复{descriptor.ConfigName}") }, descriptor, ct))
+        {
+            var payload = JsonNode.Parse(ev.Data) as JsonObject;
+            if (ev.Event == "metadata") actualModel = (string?)payload?["model"] ?? actualModel;
+            else if (ev.Event == "output") reply.Append((string?)payload?["response"] ?? "");
+        }
+        return Results.Json(new JsonObject
+        {
+            ["actual_model"] = actualModel ?? descriptor.Id,
+            ["reply"] = reply.ToString().Trim()
+        });
+    }
+    catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+});
 app.MapPut("/admin/api/settings", async (HttpContext ctx) =>
 {
     try

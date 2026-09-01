@@ -45,6 +45,9 @@ public static class TraeToolProtocol
     private static readonly Regex NumericParameter = new(
         @"^-?(?:0|[1-9]\d*)(?:\.\d+)?$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex MalformedObjectSeparator = new(
+        "(?<=[\"}])\\]\\[?\\s*(?=\"(?:name|arguments|input|parameters)\"\\s*:)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly string[] PartialGuards =
     {
         OpenTag, "<thinking>", "<think>",
@@ -164,6 +167,7 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
         private readonly bool _streamToolCalls;
         private bool _inToolCall;
         private bool _toolCallStarted;
+        private bool _bareToolCall;
         private bool _inThinking;
         private string _thinkingCloseTag = "";
         private bool _inXmlTool;
@@ -254,15 +258,31 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
                         {
                             if (final)
                             {
-                                if (_buffer.Length > 0) blocks.Add(new TraeToolInputDeltaBlock(_buffer.ToString()));
+                                string finalRemainder = _buffer.ToString();
+                                if (_bareToolCall)
+                                {
+                                    int finalWrapperCloseIndex = LastNonWhitespaceIndex(finalRemainder);
+                                    if (finalWrapperCloseIndex >= 0 && finalRemainder[finalWrapperCloseIndex] == '}')
+                                        finalRemainder = finalRemainder.Remove(finalWrapperCloseIndex, 1);
+                                }
+                                if (finalRemainder.Length > 0) blocks.Add(new TraeToolInputDeltaBlock(finalRemainder));
                                 _buffer.Clear();
                                 blocks.Add(new TraeToolUseEndBlock());
                                 ResetToolCall();
                                 break;
                             }
 
-                            int toolBoundaryLength = PartialCloseTagLength(buffered) + 1;
-                            int deltaLength = buffered.Length - toolBoundaryLength;
+                            int deltaLength;
+                            if (_bareToolCall)
+                            {
+                                int finalJsonCharacter = LastNonWhitespaceIndex(buffered);
+                                deltaLength = Math.Max(0, finalJsonCharacter);
+                            }
+                            else
+                            {
+                                int toolBoundaryLength = PartialCloseTagLength(buffered) + 1;
+                                deltaLength = buffered.Length - toolBoundaryLength;
+                            }
                             if (deltaLength > 0)
                             {
                                 blocks.Add(new TraeToolInputDeltaBlock(buffered[..deltaLength]));
@@ -300,6 +320,18 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
                     ResetToolCall();
                     continue;
                 }
+
+                if (_streamToolCalls &&
+                    TryParseToolHeader(buffered, out string bareId, out string bareName, out int bareHeaderLength))
+                {
+                    _buffer.Remove(0, bareHeaderLength);
+                    _inToolCall = true;
+                    _toolCallStarted = true;
+                    _bareToolCall = true;
+                    blocks.Add(new TraeToolUseStartBlock(bareId, bareName));
+                    continue;
+                }
+                if (_streamToolCalls && !final && IsPotentialBareToolHeader(buffered)) break;
 
                 int openIndex = buffered.IndexOf(OpenTag, StringComparison.Ordinal);
                 int thinkingIndex = -1;
@@ -372,6 +404,21 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
         {
             _inToolCall = false;
             _toolCallStarted = false;
+            _bareToolCall = false;
+        }
+
+        private static bool IsPotentialBareToolHeader(string value)
+        {
+            int cursor = SkipWhitespace(value, 0);
+            if (cursor >= value.Length || value[cursor++] != '{') return false;
+            cursor = SkipWhitespace(value, cursor);
+            if (cursor >= value.Length) return true;
+
+            const string property = "\"name\"";
+            string remainder = value[cursor..];
+            return remainder.Length <= property.Length
+                ? property.StartsWith(remainder, StringComparison.Ordinal)
+                : remainder.StartsWith(property, StringComparison.Ordinal);
         }
 
         private static bool TryParseToolHeader(string value, out string id, out string name, out int headerLength)
@@ -490,7 +537,8 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
         {
             try
             {
-                if (JsonNode.Parse(payload) is not JsonObject tool) return null;
+                string normalizedPayload = MalformedObjectSeparator.Replace(payload, ",");
+                if (JsonNode.Parse(normalizedPayload) is not JsonObject tool) return null;
                 string? name = (string?)tool["name"];
                 if (string.IsNullOrWhiteSpace(name)) return null;
                 string id = (string?)tool["id"] ?? $"toolu_{Guid.NewGuid():N}";
