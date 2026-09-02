@@ -407,8 +407,8 @@ app.MapPost("/v1/messages", async (HttpContext ctx) =>
     try { descriptor = await lease.Client.ResolveModelAsync(model, ct); }
     catch (TraeModelNotFoundException) { return UnsupportedModel(model); }
     var upstream = ChatUpstream(lease, messages, descriptor, ct);
-    IAsyncEnumerable<TraeSseEvent> RetryUpstream(string assistantPartial, string? reason) =>
-        ChatUpstream(lease, ToolRetryMessages(messages, assistantPartial, reason), descriptor, ct);
+    IAsyncEnumerable<TraeSseEvent> RetryUpstream(string assistantPartial, string? toolName, string? reason) =>
+        ChatUpstream(lease, ToolRetryMessages(messages, assistantPartial, toolName, reason), descriptor, ct);
     if (stream)
     {
         ctx.Response.ContentType = "text/event-stream";
@@ -837,17 +837,18 @@ async Task WriteOpenAIStream(Stream w, IAsyncEnumerable<TraeSseEvent> upstream, 
 
 async Task<JsonObject> CollectAnthropic(
     IAsyncEnumerable<TraeSseEvent> upstream,
-    Func<string, string?, IAsyncEnumerable<TraeSseEvent>>? retryUpstream,
+    Func<string, string?, string?, IAsyncEnumerable<TraeSseEvent>>? retryUpstream,
     string model,
     JsonArray? tools,
     bool thinkingEnabled,
     CancellationToken ct)
 {
     var result = await TraeChatResult.CollectAsync(upstream, ct);
-    if (string.IsNullOrWhiteSpace(result.Text) && string.IsNullOrWhiteSpace(result.Reasoning) && retryUpstream is not null)
+    // 只有推理、没有正文的回答对客户端等于没回答（实测 GLM-5.3 把整份代码草稿写进了推理）。
+    if (string.IsNullOrWhiteSpace(result.Text) && retryUpstream is not null)
     {
-        Console.Error.WriteLine($"[retry] {model}: upstream returned no content");
-        result = await TraeChatResult.CollectAsync(retryUpstream("", null), ct);
+        Console.Error.WriteLine($"[retry] {model}: upstream produced reasoning but no answer");
+        result = await TraeChatResult.CollectAsync(retryUpstream("", null, "no answer"), ct);
     }
     var content = new JsonArray();
     bool hasToolUse = false;
@@ -943,7 +944,8 @@ async Task<JsonObject> CollectAnthropic(
             AddText(InvalidToolCallMessage(failure.ToolName, failure.Reason));
             break;
         }
-        var retried = await TraeChatResult.CollectAsync(retryUpstream(transcript.ToString(), failure.Reason), ct);
+        var retried = await TraeChatResult.CollectAsync(
+            retryUpstream(transcript.ToString(), failure.ToolName, failure.Reason), ct);
         sourceText = retried.Text;
     }
 
@@ -964,7 +966,7 @@ async Task<JsonObject> CollectAnthropic(
 async Task WriteAnthropicStream(
     Stream w,
     IAsyncEnumerable<TraeSseEvent> upstream,
-    Func<string, string?, IAsyncEnumerable<TraeSseEvent>>? retryUpstream,
+    Func<string, string?, string?, IAsyncEnumerable<TraeSseEvent>>? retryUpstream,
     string model,
     JsonArray? tools,
     bool thinkingEnabled,
@@ -1003,6 +1005,8 @@ async Task WriteAnthropicStream(
     string? blockType = null;
     int blockIndex = -1;
     bool sawUpstreamContent = false;
+    // 推理不算答案：实测 GLM-5.3 把 58K 字符代码草稿写进推理，烧光预算后直接 end_turn。
+    bool sawAnswerContent = false;
     bool sawToolUse = false;
     int inputTokens = 0;
     int outputTokens = 0;
@@ -1190,6 +1194,7 @@ async Task WriteAnthropicStream(
                 if (!string.IsNullOrEmpty(text))
                 {
                     sawUpstreamContent = true;
+                    sawAnswerContent = true;
                     if (j["finish_reason"] is JsonValue outputReason &&
                         outputReason.TryGetValue<string>(out var parsedOutputReason))
                         finishReason = parsedOutputReason;
@@ -1206,10 +1211,10 @@ async Task WriteAnthropicStream(
             {
                 foreach (TraeOutputBlock block in toolParser.Complete()) await WriteBlock(block);
                 if (pendingRetry is not null) return false;
-                // 实测到上游会花 4 分钟算完再干净地 done，一个字不吐；此时下游没提交任何内容，重发无副作用。
-                if (!sawUpstreamContent)
+                // 实测两种空回答：上游算完一个字不吐，或全蹩跏在推理里。此时客户端拿不到答案，重发代价远低于直接失败。
+                if (!sawAnswerContent)
                 {
-                    pendingRetry ??= (null, null);
+                    pendingRetry ??= (null, sawUpstreamContent ? "no answer" : "no content");
                     return false;
                 }
                 if (j?["finish_reason"] is JsonValue doneReason &&
@@ -1231,8 +1236,8 @@ async Task WriteAnthropicStream(
         {
             var failed = pendingRetry!.Value;
             pendingRetry = null;
-            Console.Error.WriteLine($"[retry] {model}: {failed.Reason ?? "upstream returned no content"}");
-            completed = await RunAttempt(retryUpstream(transcript.ToString(), failed.Reason));
+            Console.Error.WriteLine($"[retry] {model}: {failed.Reason}");
+            completed = await RunAttempt(retryUpstream(transcript.ToString(), failed.ToolName, failed.Reason));
         }
         if (!completed && pendingRetry is { } unrecovered)
         {
@@ -1240,7 +1245,7 @@ async Task WriteAnthropicStream(
             if (unrecovered.ToolName is { } toolName && unrecovered.Reason is { } reason)
                 await WriteBlock(new TraeTextBlock(InvalidToolCallMessage(toolName, reason)));
             else
-                throw new TraeUpstreamException("Trae 上游连续两次完成但未返回任何内容。");
+                throw new TraeUpstreamException("Trae 上游连续两次只输出推理，未给出任何答案。");
         }
 
         await CloseBlock();
@@ -1284,19 +1289,22 @@ void LogRejectedToolCall(string toolName, string error, string payload)
     TraeToolCorpus.Record(toolName, error, payload);
 }
 
-List<(string role, string text)> ToolRetryMessages(List<(string role, string text)> messages, string assistantPartial, string? reason)
+List<(string role, string text)> ToolRetryMessages(List<(string role, string text)> messages, string assistantPartial, string? toolName, string? reason)
 {
     // reason 为空表示上游本次什么都没吐，原样重发即可。
     if (reason is null) return messages;
 
     var retry = new List<(string role, string text)>(messages);
     if (!string.IsNullOrWhiteSpace(assistantPartial)) retry.Add(("assistant", assistantPartial));
-    retry.Add(("user",
-        $"Your previous tool call could not be used ({reason}). Do not apologize and do not repeat any prose. " +
-        "Re-emit only that single tool call. If any value is long, multi-line, or contains quotes, use the raw form " +
-        "<tool_call name=\"...\"><parameter name=\"...\">raw value</parameter></tool_call> so nothing needs escaping; " +
-        "otherwise emit one complete <tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call> block with balanced braces " +
-        "and every required property present."));
+    retry.Add(("user", toolName is null
+        ? "Your previous attempt produced no answer: you reasoned at length but never emitted user-visible output or a tool call. " +
+          "Do not draft the solution inside your reasoning this time -- reasoning is for a short plan only. " +
+          "Think briefly, then immediately emit the tool call or the answer."
+        : $"Your previous tool call could not be used ({reason}). Do not apologize and do not repeat any prose. " +
+          "Re-emit only that single tool call. If any value is long, multi-line, or contains quotes, use the raw form " +
+          "<tool_call name=\"...\"><parameter name=\"...\">raw value</parameter></tool_call> so nothing needs escaping; " +
+          "otherwise emit one complete <tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call> block with balanced braces " +
+          "and every required property present."));
     return retry;
 }
 

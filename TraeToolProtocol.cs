@@ -73,6 +73,10 @@ public static class TraeToolProtocol
     private static readonly Regex XmlAttribute = new(
         "(?<key>[A-Za-z_][\\w.\\-]*)\\s*=\\s*\"(?<value>[^\"]*)\"",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    // 模型会把 Form A 的 JSON 和 Form B 的 <parameter> 混着写，后续参数于是被吞进上一个字符串值里。
+    private static readonly Regex EmbeddedParameterBoundary = new(
+        "</?parameter\\s+name\\s*=\\s*[\"'](?<key>[^\"']+)[\"'][^>]*>",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly string[] PartialGuards =
     {
         OpenTag, "<thinking>", "<think>",
@@ -116,6 +120,7 @@ public static class TraeToolProtocol
                 _ => "Call an available tool whenever it is needed to complete the request. Requests to create, read, modify, search, run, or inspect files, code, commands, or workspace state MUST use the appropriate tools. Never claim that an action was completed without a successful tool result."
             };
             sections.Add(choiceInstruction + "\n" + """
+Reasoning is for a short plan only. Never draft the full file, code, or answer inside your reasoning; produce it once, in the tool call itself. A turn that ends after reasoning without a tool call or a visible answer is a failed turn.
 You have access to the tools described below. When a tool is needed, emit a tool call using one of the two forms below and do not describe the call as prose.
 Form A (preferred for short values) — one JSON object whose keys MUST be in this order, name first, arguments second:
 <tool_call>{"name":"tool_name","arguments":{"parameter":"value"}}</tool_call>
@@ -279,8 +284,35 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
         arguments = new JsonObject();
         if (string.IsNullOrWhiteSpace(serialized)) return true;
         if (TryParseJsonObject(serialized) is not { } parsed) return false;
-        arguments = parsed;
+        arguments = SplitEmbeddedParameters(parsed);
         return true;
+    }
+
+    private static JsonObject SplitEmbeddedParameters(JsonObject arguments)
+    {
+        foreach (var property in arguments.ToArray())
+        {
+            if (property.Value is not JsonValue value ||
+                !value.TryGetValue(out string? text) ||
+                text is null) continue;
+
+            MatchCollection boundaries = EmbeddedParameterBoundary.Matches(text);
+            if (boundaries.Count == 0) continue;
+
+            arguments[property.Key] = JsonValue.Create(text[..boundaries[0].Index]);
+            for (int index = 0; index < boundaries.Count; index++)
+            {
+                string key = boundaries[index].Groups["key"].Value;
+                if (arguments[key] is JsonValue existing &&
+                    existing.TryGetValue(out string? current) &&
+                    !string.IsNullOrEmpty(current)) continue;
+
+                int start = boundaries[index].Index + boundaries[index].Length;
+                int end = index + 1 < boundaries.Count ? boundaries[index + 1].Index : text.Length;
+                arguments[key] = JsonValue.Create(TrailingCloseTag.Replace(text[start..end], ""));
+            }
+        }
+        return arguments;
     }
 
     private static string ToolNameHint(string payload)
@@ -831,7 +863,8 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
                 arguments = TryParseJsonObject(serialized ?? "{}");
             // 部分模型把参数与 name 平铺在同一层，而不是包进 arguments。
             if (arguments is not JsonObject) arguments = FlattenedArguments(tool);
-            return new TraeToolUseBlock(id, name, arguments as JsonObject ?? new JsonObject());
+            return new TraeToolUseBlock(id, name,
+                arguments is JsonObject argumentObject ? SplitEmbeddedParameters(argumentObject) : new JsonObject());
         }
 
         private static JsonObject? ParseToolObject(string? candidate) =>

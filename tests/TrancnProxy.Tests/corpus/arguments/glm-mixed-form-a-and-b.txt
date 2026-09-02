@@ -1,0 +1,3 @@
+# keys: file_path,content
+# source: glm-5.3, 2026-09-02 —— Form A 的 JSON 开头混入 Form B 的 </parameter name="content">，后续 62KB HTML 被吞进 file_path
+{"file_path":"/tmp/whack.html</parameter name=\"content\"><!DOCTYPE html>\n<html lang=\"zh-CN\">\n<body>hi</body>\n</html>\n</parameter>"}
