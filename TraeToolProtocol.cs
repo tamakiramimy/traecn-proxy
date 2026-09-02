@@ -38,10 +38,10 @@ public static class TraeToolProtocol
 
     // 模型常以自身原生 XML 语法发起工具调用（DeepSeek 用全角 ｜DSML｜，Qwen 用带 name 属性的 tool_call），需与 <tool_call> JSON 一并识别。
     private static readonly Regex XmlToolOpen = new(
-        "<(?<tag>｜DSML｜|antml:invoke|invoke|function_call|tool_call)\\s+name\\s*=\\s*[\"'](?<name>[^\"']+)[\"']\\s*>",
+        "<(?<tag>｜DSML｜|antml:invoke|invoke|function_calls|function_call|function|tool_call)\\s+name\\s*=\\s*[\"'](?<name>[^\"']+)[\"'][^>]*>",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly Regex XmlToolParameter = new(
-        "<parameter\\s+name\\s*=\\s*[\"'](?<key>[^\"']+)[\"']\\s*>(?<value>.*?)</parameter>",
+        "<parameter\\s+name\\s*=\\s*[\"'](?<key>[^\"']+)[\"'][^>]*>(?<value>.*?)</parameter>",
         RegexOptions.Compiled | RegexOptions.Singleline | RegexOptions.CultureInvariant);
     private static readonly Regex XmlToolWrapper = new(
         "</?(?:antml:)?(?:tool_calls|function_calls)\\s*>",
@@ -65,6 +65,13 @@ public static class TraeToolProtocol
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly Regex ToolNameProperty = new(
         "\"name\"\\s*:\\s*\"(?<name>[^\"]{1,120})\"",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    // 部分模型把工具名裸写在载荷开头，后面直接跟 JSON 或 XML 属性。
+    private static readonly Regex BareNameToolCall = new(
+        @"^\s*(?<name>[A-Za-z_][\w.\-]{0,63})\s*(?<rest>[\s\S]*)$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex XmlAttribute = new(
+        "(?<key>[A-Za-z_][\\w.\\-]*)\\s*=\\s*\"(?<value>[^\"]*)\"",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly string[] PartialGuards =
     {
@@ -783,9 +790,34 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
         {
             // 模型有时把同一个调用重复输出多份，只取第一个完整对象。
             string cleaned = DsmlNoise.Replace(payload, " ");
-            if (ParseToolObject(FirstJsonObject(cleaned)) is { } tool) return BuildToolUse(tool);
-            return ParseToolObject(TrailingCloseTag.Replace(cleaned, "").TrimEnd()) is { } repaired
-                ? BuildToolUse(repaired)
+            if (ParseToolObject(FirstJsonObject(cleaned)) is { } tool && BuildToolUse(tool) is { } fromFirst)
+                return fromFirst;
+            if (ParseToolObject(TrailingCloseTag.Replace(cleaned, "").TrimEnd()) is { } repaired &&
+                BuildToolUse(repaired) is { } fromRepair)
+                return fromRepair;
+            return ParseBareNameToolUse(cleaned);
+        }
+
+        private static TraeToolUseBlock? ParseBareNameToolUse(string payload)
+        {
+            string rest = TrailingCloseTag.Replace(payload, "").Trim();
+            Match match = BareNameToolCall.Match(rest);
+            if (!match.Success) return null;
+
+            string name = match.Groups["name"].Value;
+            rest = match.Groups["rest"].Value.Trim();
+            if (rest.EndsWith("/>", StringComparison.Ordinal)) rest = rest[..^2].TrimEnd();
+
+            if (rest.StartsWith('{'))
+                return TryParseJsonObject(rest) is { } arguments
+                    ? new TraeToolUseBlock($"toolu_{Guid.NewGuid():N}", name, arguments)
+                    : null;
+
+            var attributes = new JsonObject();
+            foreach (Match attribute in XmlAttribute.Matches(rest))
+                attributes[attribute.Groups["key"].Value] = JsonValue.Create(attribute.Groups["value"].Value);
+            return attributes.Count > 0
+                ? new TraeToolUseBlock($"toolu_{Guid.NewGuid():N}", name, attributes)
                 : null;
         }
 

@@ -1,0 +1,3 @@
+# tool: Read
+# source: 线上 2026-09-02 —— <function> 标签 + <parameter> 带额外属性 string="true"
+<function name="Read"><parameter name="file_path" string="true">/etc/hostname</parameter></function>

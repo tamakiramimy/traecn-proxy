@@ -1,0 +1,3 @@
+# tool: Read
+# source: 线上 2026-09-02 —— 工具名裸写在 JSON 前，没有 "name" 键
+<tool_call>Read{"file_path":"/etc/hostname"}</tool_call>

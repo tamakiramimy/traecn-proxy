@@ -35,19 +35,27 @@ public sealed class TraeModelCatalogSnapshot
     /// <summary>Initializes a catalog snapshot.</summary>
     /// <param name="models">Selectable models in server order.</param>
     /// <param name="retrievedAt">The time at which the catalog was retrieved.</param>
-    public TraeModelCatalogSnapshot(IEnumerable<TraeModelDescriptor> models, DateTimeOffset retrievedAt)
+    /// <param name="skipped">Upstream configs that were filtered out, with the reason.</param>
+    public TraeModelCatalogSnapshot(
+        IEnumerable<TraeModelDescriptor> models,
+        DateTimeOffset retrievedAt,
+        IEnumerable<string>? skipped = null)
     {
         ArgumentNullException.ThrowIfNull(models);
 
         var modelList = models.ToArray();
         Models = Array.AsReadOnly(modelList);
         RetrievedAt = retrievedAt;
+        Skipped = Array.AsReadOnly((skipped ?? []).ToArray());
         _modelsById = new ReadOnlyDictionary<string, TraeModelDescriptor>(
             modelList.ToDictionary(model => model.Id, StringComparer.Ordinal));
     }
 
     /// <summary>Gets the selectable models in server order.</summary>
     public IReadOnlyList<TraeModelDescriptor> Models { get; }
+
+    /// <summary>Gets the upstream configs that were filtered out, each with its reason.</summary>
+    public IReadOnlyList<string> Skipped { get; }
 
     /// <summary>Gets the time at which this snapshot was retrieved.</summary>
     public DateTimeOffset RetrievedAt { get; }
@@ -179,6 +187,7 @@ public static class TraeModelCatalogParser
 
         var descriptors = new List<TraeModelDescriptor>();
         var descriptorsById = new Dictionary<string, TraeModelDescriptor>(StringComparer.Ordinal);
+        var skipped = new List<string>();
         var configInfos = RequiredArray(chatConfigs[0], "config_info_list", "chat_v3");
         foreach (var configNode in configInfos)
         {
@@ -186,11 +195,23 @@ public static class TraeModelCatalogParser
                 throw new TraeModelCatalogException("chat_v3.config_info_list must contain objects.");
 
             string configName = RequiredString(config, "config_name", "chat_v3 config");
-            if (!RequiredBoolean(config, "config_switch", configName)) continue;
-            if (OptionalBoolean(config, "is_invisible_to_user", configName) == true) continue;
+            if (!RequiredBoolean(config, "config_switch", configName))
+            {
+                skipped.Add($"{configName} (config_switch=false)");
+                continue;
+            }
+            if (OptionalBoolean(config, "is_invisible_to_user", configName) == true)
+            {
+                skipped.Add($"{configName} (is_invisible_to_user=true)");
+                continue;
+            }
 
             string displayName = StringValue(config["display_config"]?["display_name"]);
-            if (string.IsNullOrWhiteSpace(displayName)) continue;
+            if (string.IsNullOrWhiteSpace(displayName))
+            {
+                skipped.Add($"{configName} (no display_name)");
+                continue;
+            }
 
             var modelDetails = RequiredArray(config, "model_detail_list", configName);
             foreach (var detailNode in modelDetails)
@@ -215,7 +236,7 @@ public static class TraeModelCatalogParser
         if (descriptors.Count == 0)
             throw new TraeModelCatalogException("Model catalog contains no selectable chat_v3 models.");
 
-        return new TraeModelCatalogSnapshot(descriptors, retrievedAt ?? DateTimeOffset.UtcNow);
+        return new TraeModelCatalogSnapshot(descriptors, retrievedAt ?? DateTimeOffset.UtcNow, skipped);
     }
 
     private static JsonArray RequiredArray(JsonObject owner, string propertyName, string ownerName) =>

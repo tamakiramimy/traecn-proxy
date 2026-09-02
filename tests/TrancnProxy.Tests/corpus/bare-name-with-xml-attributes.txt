@@ -1,0 +1,3 @@
+# tool: Read
+# source: 线上 2026-09-02 —— 自闭合标签，参数直接写成 XML 属性
+<tool_call>Read file_path="/etc/hostname" ignore_errors="false" /></tool_call>

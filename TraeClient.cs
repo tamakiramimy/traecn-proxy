@@ -16,8 +16,10 @@ public sealed class TraeUpstreamException(string message) : InvalidOperationExce
 {
 }
 
-public sealed class TraeIncompleteStreamException()
-    : InvalidOperationException("Trae 响应在完成事件前中断。")
+public sealed class TraeIncompleteStreamException(string? detail = null)
+    : InvalidOperationException(detail is null
+        ? "Trae 响应在完成事件前中断。"
+        : $"Trae 响应在完成事件前中断（{detail}）。")
 {
 }
 
@@ -232,6 +234,10 @@ public class TraeClient
         string? eventName = null;
         var dataLines = new List<string>();
         bool receivedMetadata = false;
+        long streamStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+        long lastFrameAt = streamStarted;
+        var frameCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        int responseChars = 0;
 
         TraeSseEvent? TakeFrame()
         {
@@ -254,6 +260,9 @@ public class TraeClient
                 var frame = TakeFrame();
                 if (frame is null) continue;
                 ValidateFrame(frame);
+                frameCounts[frame.Event] = frameCounts.GetValueOrDefault(frame.Event) + 1;
+                lastFrameAt = System.Diagnostics.Stopwatch.GetTimestamp();
+                if (frame.Event == "output") responseChars += frame.Data.Length;
                 yield return frame;
                 if (frame.Event == "done") yield break;
                 continue;
@@ -272,10 +281,16 @@ public class TraeClient
         if (finalFrame is not null)
         {
             ValidateFrame(finalFrame);
+            frameCounts[finalFrame.Event] = frameCounts.GetValueOrDefault(finalFrame.Event) + 1;
+            lastFrameAt = System.Diagnostics.Stopwatch.GetTimestamp();
             yield return finalFrame;
             if (finalFrame.Event == "done") yield break;
         }
-        throw new TraeIncompleteStreamException();
+        throw new TraeIncompleteStreamException(
+            $"{System.Diagnostics.Stopwatch.GetElapsedTime(streamStarted).TotalSeconds:F0}s, " +
+            $"末帧后静默 {System.Diagnostics.Stopwatch.GetElapsedTime(lastFrameAt).TotalSeconds:F0}s, " +
+            $"帧 [{string.Join(", ", frameCounts.Select(pair => $"{pair.Key}={pair.Value}"))}], " +
+            $"output {responseChars} 字符");
 
         void ValidateFrame(TraeSseEvent frame)
         {
