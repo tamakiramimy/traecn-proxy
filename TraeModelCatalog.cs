@@ -25,7 +25,9 @@ public sealed record TraeModelDescriptor(
     string Id,
     string ConfigName,
     string DisplayName,
-    TraeModelVariant Variant);
+    TraeModelVariant Variant,
+    int? DevContextWindow = null,
+    int? MaxContextWindow = null);
 
 /// <summary>An immutable snapshot of selectable models for one TRAE account.</summary>
 public sealed class TraeModelCatalogSnapshot
@@ -213,6 +215,8 @@ public static class TraeModelCatalogParser
                 continue;
             }
 
+            int? devContextWindow = OptionalInteger(config["context_window_tokens"]?["dev"], configName, "dev");
+            int? maxContextWindow = OptionalInteger(config["context_window_tokens"]?["max"], configName, "max");
             var modelDetails = RequiredArray(config, "model_detail_list", configName);
             foreach (var detailNode in modelDetails)
             {
@@ -220,7 +224,13 @@ public static class TraeModelCatalogParser
                     throw new TraeModelCatalogException($"{configName}.model_detail_list must contain objects.");
 
                 string modelId = RequiredString(detail, "model_name", configName);
-                var descriptor = new TraeModelDescriptor(modelId, configName, displayName, GetVariant(modelId));
+                var descriptor = new TraeModelDescriptor(
+                    modelId,
+                    configName,
+                    displayName,
+                    GetVariant(modelId),
+                    devContextWindow,
+                    maxContextWindow);
                 if (descriptorsById.TryGetValue(modelId, out var existing))
                 {
                     if (existing != descriptor)
@@ -266,6 +276,14 @@ public static class TraeModelCatalogParser
     private static string StringValue(JsonNode? node) =>
         node is JsonValue value && value.TryGetValue<string>(out string? result) ? result ?? "" : "";
 
+    private static int? OptionalInteger(JsonNode? node, string configName, string variant)
+    {
+        if (node is null) return null;
+        if (node is JsonValue value && value.TryGetValue<int>(out int result) && result > 0) return result;
+        throw new TraeModelCatalogException(
+            $"{configName}.context_window_tokens.{variant} must be a positive integer when present.");
+    }
+
     private static TraeModelVariant GetVariant(string modelId)
     {
         if (modelId.EndsWith("__dev", StringComparison.Ordinal)) return TraeModelVariant.Dev;
@@ -297,12 +315,16 @@ public static class TraeModelCatalogParser
             if (OptionalBoolean(config, "is_invisible_to_user", configName) == true) continue;
 
             string displayName = StringValue(config["display_config"]?["display_name"]);
+            int? devContextWindow = OptionalInteger(config["context_window_tokens"]?["dev"], configName, "dev");
+            int? maxContextWindow = OptionalInteger(config["context_window_tokens"]?["max"], configName, "max");
             // 该服务面按 config_name 选模型，model_detail_list 里的 __dev/__max 只是内部变体。
             descriptors.Add(new TraeModelDescriptor(
                 configName,
                 configName,
                 string.IsNullOrWhiteSpace(displayName) ? configName : displayName,
-                GetVariant(configName)));
+                GetVariant(configName),
+                devContextWindow,
+                maxContextWindow));
         }
 
         if (descriptors.Count == 0)

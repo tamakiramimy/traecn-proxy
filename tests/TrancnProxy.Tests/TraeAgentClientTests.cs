@@ -1,6 +1,7 @@
 using System.Net;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using FluentAssertions;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using TrancnProxy.Agent;
@@ -129,6 +130,53 @@ public sealed class TraeAgentClientTests
         body.RootElement.GetProperty("model").GetString().Should().Be("glm-5.3__dev");
         body.RootElement.GetProperty("config_name").GetString().Should().Be("glm-5.3");
         events.Select(streamEvent => streamEvent.Event).Should().Equal("metadata", "output", "done");
+    }
+
+    [TestMethod]
+    public async Task ChatStreamAsync_SendsEffortAndMaxModelTuning()
+    {
+        var handler = new RecordingHandler("event: metadata\ndata: {\"model\":\"deepseek-v4-flash__max\"}\n\nevent: output\ndata: {\"response\":\"ok\"}\n\nevent: done\ndata: {\"finish_reason\":\"stop\"}\n\n");
+        var client = new TraeClient(
+            new TraeAuthData { Token = "test-token", ApiHost = "https://console.example" },
+            httpMessageHandler: handler);
+        var model = new TraeModelDescriptor(
+            "deepseek-v4-flash__max",
+            "DeepSeek-V4-Flash",
+            "DeepSeek-V4-Flash",
+            TraeModelVariant.Max,
+            112000,
+            200000);
+
+        await foreach (var _ in client.ChatStreamAsync(
+            [("user", "ping")],
+            model,
+            new TraeChatTuning(TraeReasoningEffort.ExtraHigh)))
+        {
+        }
+
+        using var body = JsonDocument.Parse(handler.Body!);
+        body.RootElement.GetProperty("reasoning_effort_level").GetString().Should().Be("extra_high");
+        body.RootElement.GetProperty("model_auto_selection").GetProperty("strategy").GetString().Should().Be("max");
+        body.RootElement.GetProperty("context_window_size").GetInt32().Should().Be(200000);
+    }
+
+    [TestMethod]
+    public void ExtraChatFields_CannotOverrideReservedFields()
+    {
+        var body = new JsonObject { ["model"] = "expected" };
+
+        Action merge = () => TraeClient.ApplyExtraChatFields(body, "{\"model\":\"wrong\"}");
+
+        merge.Should().Throw<InvalidDataException>().WithMessage("*reserved field 'model'*");
+        body["model"]!.GetValue<string>().Should().Be("expected");
+    }
+
+    [TestMethod]
+    public void ExtraChatFields_RequiresJsonObject()
+    {
+        Action merge = () => TraeClient.ApplyExtraChatFields(new JsonObject(), "[]");
+
+        merge.Should().Throw<InvalidDataException>().WithMessage("*JSON object*");
     }
 
     [TestMethod]

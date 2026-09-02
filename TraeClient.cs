@@ -28,6 +28,12 @@ public sealed class TraeIncompleteStreamException(string? detail = null)
 /// </summary>
 public class TraeClient
 {
+    private static readonly HashSet<string> ReservedChatFields = new(StringComparer.Ordinal)
+    {
+        "messages", "model", "config_name", "function", "stream", "request_id", "session_id",
+        "reasoning_effort_level", "model_auto_selection", "context_window_size"
+    };
+
     public const string DefaultAppId = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
     public const string DefaultClientId = "ono9krqynydwx5";
 
@@ -185,7 +191,7 @@ public class TraeClient
     public IAsyncEnumerable<TraeSseEvent> ChatStreamAsync(
         IEnumerable<(string role, string text)> messages, string model, CancellationToken ct = default)
     {
-        return ChatStreamCore(messages, model, model, ct);
+        return ChatStreamCore(messages, model, model, null, ct);
     }
 
     /// <summary>Streams a chat completion for an exact catalog model.</summary>
@@ -197,11 +203,26 @@ public class TraeClient
         IEnumerable<(string role, string text)> messages, TraeModelDescriptor model, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(model);
-        return ChatStreamCore(messages, model.Id, model.ConfigName, ct);
+        return ChatStreamCore(messages, model.Id, model.ConfigName, null, ct);
+    }
+
+    public IAsyncEnumerable<TraeSseEvent> ChatStreamAsync(
+        IEnumerable<(string role, string text)> messages,
+        TraeModelDescriptor model,
+        TraeChatTuning tuning,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(model);
+        ArgumentNullException.ThrowIfNull(tuning);
+        return ChatStreamCore(messages, model.Id, model.ConfigName, tuning.ApplyModel(model), ct);
     }
 
     private async IAsyncEnumerable<TraeSseEvent> ChatStreamCore(
-        IEnumerable<(string role, string text)> messages, string model, string configName, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
+        IEnumerable<(string role, string text)> messages,
+        string model,
+        string configName,
+        TraeChatTuning? tuning,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
         var msgList = new JsonArray();
         foreach (var (role, text) in messages)
@@ -222,9 +243,16 @@ public class TraeClient
             ["request_id"] = sessionId,
             ["session_id"] = sessionId
         };
+        if (tuning?.UpstreamReasoningEffort is { } reasoningEffort)
+            body["reasoning_effort_level"] = reasoningEffort;
+        if (tuning?.UpstreamModelSelectionStrategy is { } selectionStrategy)
+            body["model_auto_selection"] = new JsonObject { ["strategy"] = selectionStrategy };
+        if (tuning?.ContextWindowSize is { } contextWindowSize)
+            body["context_window_size"] = contextWindowSize;
 
         var req = new HttpRequestMessage(HttpMethod.Post, $"{_chatApiHost}/api/agent/v3/llm_utils_chat");
         AddHeaders(req, _face.Profile);
+        ApplyExtraChatFields(body, Environment.GetEnvironmentVariable("TRANCN_EXTRA_CHAT_FIELDS"));
         req.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
 
         using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
@@ -234,7 +262,7 @@ public class TraeClient
             throw new InvalidOperationException($"Trae API {resp.StatusCode}: {Truncate(err, 300)}");
         }
 
-        await using var stream = await resp.Content.ReadAsStreamAsync(ct);
+        using var stream = await resp.Content.ReadAsStreamAsync(ct);
         using var reader = new StreamReader(stream);
         string? eventName = null;
         var dataLines = new List<string>();
@@ -318,6 +346,30 @@ public class TraeClient
             }
             else if (frame.Event == "output" && !receivedMetadata)
                 throw new TraeUpstreamException("Trae 响应缺少模型 metadata，无法确认实际调用模型。");
+        }
+    }
+
+    internal static void ApplyExtraChatFields(JsonObject body, string? serializedFields)
+    {
+        ArgumentNullException.ThrowIfNull(body);
+        if (string.IsNullOrWhiteSpace(serializedFields)) return;
+
+        JsonObject extra;
+        try
+        {
+            extra = JsonNode.Parse(serializedFields) as JsonObject
+                ?? throw new InvalidDataException("TRANCN_EXTRA_CHAT_FIELDS must be a JSON object.");
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidDataException("TRANCN_EXTRA_CHAT_FIELDS contains invalid JSON.", ex);
+        }
+
+        foreach (var field in extra)
+        {
+            if (ReservedChatFields.Contains(field.Key))
+                throw new InvalidDataException($"TRANCN_EXTRA_CHAT_FIELDS cannot override reserved field '{field.Key}'.");
+            body[field.Key] = field.Value?.DeepClone();
         }
     }
 

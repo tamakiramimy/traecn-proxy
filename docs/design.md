@@ -94,7 +94,9 @@ console.enterprise.trae.cn(上游,经企业代理)
 - OpenAI Responses:`/v1/responses`(流式/非流式)。
 - Anthropic:`/v1/messages` + `/v1/messages/count_tokens`。
 - 可选模型对话通过当前 TRAE IDE Agent 执行；首次请求安装初始化 hook 并重载 workbench，请求串行化，实际模型 metadata 必须与请求 ID 一致。
-- **待增强**:tool_use/tool_result 结构化往返(参考 laojichao 项目的 `<tool_call>` 解析策略)、reasoning_content 与 response 的分离输出、Anthropic 严格交错校验(role 交替)。
+- Anthropic 已实现 tool_use/tool_result 结构化往返，并通过模型策略统一分类 `reasoning_content` 与 `response`：carrier 模型从两个通道提取工具，裸 reasoning 提升为正文；native-thinking 模型保留裸 reasoning 为 thinking。
+- Anthropic thinking budget、OpenAI reasoning effort 与 Responses reasoning effort 统一映射为 Trae tuning；Max 策略和上下文窗口来自模型变体与目录元数据。低层 `llm_utils_chat` 对 effort 的实际执行效果仍需真实对照探针确认。
+- **待增强**:Anthropic 严格交错校验(role 交替)，以及 OpenAI/Responses 的结构化工具输出。
 
 ### 3.5 开发期协议证据(进行中)
 - 使用 `--protocol-evidence-dir /tmp/trae-protocol-evidence` 执行一次普通 Agent 的“新建会话 -> 首条纯文本消息”取证；目录不能位于工作区内。
@@ -147,10 +149,10 @@ console.enterprise.trae.cn(上游,经企业代理)
 
 1. **IDE bridge 稳定性**(高):模型选择已通过产品 UI/Aha 事件链解决；TRAE 升级后 DOM 选择器或 IPC 事件结构可能变化，需要用端到端探针及时发现。bridge 绑定当前 IDE 登录账号并串行执行，不参与多账号负载均衡。
 2. **ExchangeToken 实测**(高):8-30 前后自动触发或手动把 `expiredAt` 改早触发,确认响应字段与轮换副作用。
-3. **reasoning 输出混入 response**(中):部分模型把思考内容放在 `response` 字段;需按 `reasoning_content` 分离处理。
+3. **reasoning 字段语义随模型变化**(中):已用 carrier/native-thinking 策略修复已知 GLM/Kimi/DeepSeek/Qwen；新增模型仍需通过合成语料和真实会话判断默认策略，必要时使用配置覆盖。
 4. **多端 token 竞争**(中):网关与 IDE 同时刷新会互相轮换。方案:以 storage.json 为准的单写者(刷新互斥 + 回写),或网关刷新后立即回写并在 30s 内不回读旧缓存。
 5. **用量/配额**(中):企业租户 50 亿 cue 额度;网关层需要用量统计与限额,避免共享用户耗尽额度。`/api/v1/commercial/get_session_usage` 可查用量(从 IDE 代码发现)。
-6. **Anthropic 工具调用**(中):Claude Code 完整接入需要 tool_use/tool_result 双向映射。
+6. **OpenAI/Responses 工具调用**(中):当前完整工具分类仅接入 Anthropic Messages，其他协议仍需结构化工具输出。
 7. **Windows/Linux 兼容**(低):当前按 macOS 验证;Windows 需确认设备头与数据路径(DPAPI 不涉及,因 tc 加密与系统无关)。
 
 ---

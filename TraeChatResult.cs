@@ -3,6 +3,8 @@ using System.Text.Json.Nodes;
 
 namespace TrancnProxy;
 
+public sealed record TraeOutputSegment(TraeOutputChannel Channel, string Text);
+
 public sealed record TraeChatResult(
     string Text,
     int PromptTokens,
@@ -11,6 +13,7 @@ public sealed record TraeChatResult(
     string FinishReason)
 {
     public string Reasoning { get; init; } = "";
+    public IReadOnlyList<TraeOutputSegment> Segments { get; init; } = [];
 
     public static async Task<TraeChatResult> CollectAsync(
         IAsyncEnumerable<TraeSseEvent> upstream,
@@ -18,6 +21,7 @@ public sealed record TraeChatResult(
     {
         var text = new StringBuilder();
         var reasoning = new StringBuilder();
+        var segments = new List<TraeOutputSegment>();
         int promptTokens = 0;
         int completionTokens = 0;
         int totalTokens = 0;
@@ -32,8 +36,14 @@ public sealed record TraeChatResult(
             switch (streamEvent.Event)
             {
                 case "output":
-                    text.Append((string?)payload?["response"] ?? "");
-                    reasoning.Append((string?)payload?["reasoning_content"] ?? "");
+                    string reasoningChunk = (string?)payload?["reasoning_content"] ?? "";
+                    string responseChunk = (string?)payload?["response"] ?? "";
+                    reasoning.Append(reasoningChunk);
+                    text.Append(responseChunk);
+                    if (reasoningChunk.Length > 0)
+                        segments.Add(new TraeOutputSegment(TraeOutputChannel.Reasoning, reasoningChunk));
+                    if (responseChunk.Length > 0)
+                        segments.Add(new TraeOutputSegment(TraeOutputChannel.Response, responseChunk));
                     if (payload?["finish_reason"] is JsonValue outputReason &&
                         outputReason.TryGetValue<string>(out var parsedOutputReason))
                         finishReason = parsedOutputReason;
@@ -58,7 +68,8 @@ public sealed record TraeChatResult(
         }
 
         if (!completed) throw new TraeIncompleteStreamException();
-        if (text.Length == 0) throw new TraeUpstreamException("Trae 上游完成但未返回有效内容。");
+        if (text.Length == 0 && reasoning.Length == 0)
+            throw new TraeUpstreamException("Trae 上游完成但未返回有效内容。");
         if (totalTokens == 0 && (promptTokens > 0 || completionTokens > 0))
             totalTokens = promptTokens + completionTokens;
 
@@ -69,7 +80,8 @@ public sealed record TraeChatResult(
             totalTokens,
             finishReason)
         {
-            Reasoning = reasoning.ToString()
+            Reasoning = reasoning.ToString(),
+            Segments = segments
         };
     }
 }

@@ -57,6 +57,7 @@ public sealed class ProxySettings
 
         public ClientProfileSettings Enterprise { get; set; } = new();
         public ClientProfileSettings Solo { get; set; } = new();
+        public ReasoningSettings Reasoning { get; set; } = new();
 
         /// <summary>
         /// 人工核验过的“请求模型 -> 上游实际模型名”白名单。
@@ -70,6 +71,36 @@ public sealed class ProxySettings
             Enterprise.ToOverrides(),
             Solo.ToOverrides(),
             ModelAliases);
+    }
+
+    public sealed class ReasoningSettings
+    {
+        public int ExtraHighBudgetThreshold { get; set; } = TraeChatTuning.DefaultExtraHighBudgetThreshold;
+        public string[] CarrierModelPatterns { get; set; } = ["glm", "kimi", "deepseek", "qwen"];
+        public string[] NativeThinkingModelPatterns { get; set; } = [];
+
+        internal int ValidatedBudgetThreshold()
+        {
+            if (ExtraHighBudgetThreshold <= 0)
+                throw new InvalidDataException("Upstream:Reasoning:ExtraHighBudgetThreshold must be greater than zero.");
+            return ExtraHighBudgetThreshold;
+        }
+
+        internal TraeReasoningPresentation ResolvePresentation(TraeModelDescriptor model)
+        {
+            ArgumentNullException.ThrowIfNull(model);
+            string identity = $"{model.Id}\n{model.ConfigName}\n{model.DisplayName}";
+            if (Matches(identity, NativeThinkingModelPatterns))
+                return TraeReasoningPresentation.NativeThinking;
+            return Matches(identity, CarrierModelPatterns)
+                ? TraeReasoningPresentation.Carrier
+                : TraeReasoningPresentation.NativeThinking;
+        }
+
+        private static bool Matches(string identity, IEnumerable<string>? patterns) =>
+            patterns?.Any(pattern =>
+                !string.IsNullOrWhiteSpace(pattern) &&
+                identity.Contains(pattern, StringComparison.OrdinalIgnoreCase)) == true;
     }
 
     /// <summary>客户端画像覆盖项，留空表示沿用内置默认值。</summary>

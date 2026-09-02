@@ -64,6 +64,21 @@ public sealed class TraeReliabilityTests
     }
 
     [TestMethod]
+    public async Task ChatStreamAsync_CanStopEarlyWhenResponseStreamDoesNotSupportAsyncDispose()
+    {
+        var responseStream = new SyncOnlyDisposeStream(Encoding.UTF8.GetBytes(
+            "event: metadata\ndata: {\"model\":\"glm-5.3__dev\"}\n\n" +
+            "event: output\ndata: {\"response\":\"ok\"}\n\n" +
+            "event: done\ndata: {\"finish_reason\":\"stop\"}\n\n"));
+        var client = CreateClient(new StreamResponseHandler(responseStream));
+
+        await foreach (var _ in client.ChatStreamAsync(new[] { ("user", "ping") }, "glm-5.3__dev"))
+            break;
+
+        responseStream.WasDisposed.Should().BeTrue();
+    }
+
+    [TestMethod]
     public async Task ChatResult_UsesRealUsageAndFinishReason()
     {
         var events = Events(
@@ -74,7 +89,11 @@ public sealed class TraeReliabilityTests
 
         var result = await TraeChatResult.CollectAsync(events);
 
-        result.Should().Be(new TraeChatResult("hello", 12, 3, 15, "length"));
+        result.Text.Should().Be("hello");
+        result.PromptTokens.Should().Be(12);
+        result.CompletionTokens.Should().Be(3);
+        result.TotalTokens.Should().Be(15);
+        result.FinishReason.Should().Be("length");
     }
 
     [TestMethod]
@@ -90,6 +109,22 @@ public sealed class TraeReliabilityTests
 
         result.Text.Should().Be("answer");
         result.Reasoning.Should().Be("first second");
+        result.Segments.Should().Equal(
+            new TraeOutputSegment(TraeOutputChannel.Reasoning, "first "),
+            new TraeOutputSegment(TraeOutputChannel.Reasoning, "second"),
+            new TraeOutputSegment(TraeOutputChannel.Response, "answer"));
+    }
+
+    [TestMethod]
+    public async Task ChatResult_AllowsReasoningOnlyForDownstreamClassification()
+    {
+        var result = await TraeChatResult.CollectAsync(Events(
+            new TraeSseEvent("output", "{\"reasoning_content\":\"visible carrier text\"}"),
+            new TraeSseEvent("done", "{\"finish_reason\":\"stop\"}")));
+
+        result.Text.Should().BeEmpty();
+        result.Segments.Should().ContainSingle()
+            .Which.Should().Be(new TraeOutputSegment(TraeOutputChannel.Reasoning, "visible carrier text"));
     }
 
     [TestMethod]
@@ -261,6 +296,29 @@ public sealed class TraeReliabilityTests
         {
             Content = new StringContent(responseBody, Encoding.UTF8, "text/event-stream")
         });
+    }
+
+    private sealed class StreamResponseHandler(Stream responseStream) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StreamContent(responseStream)
+        });
+    }
+
+    private sealed class SyncOnlyDisposeStream(byte[] buffer) : MemoryStream(buffer)
+    {
+        public bool WasDisposed { get; private set; }
+
+        protected override void Dispose(bool disposing)
+        {
+            WasDisposed = true;
+            base.Dispose(disposing);
+        }
+
+        public override ValueTask DisposeAsync() => throw new NotSupportedException();
     }
 
 }

@@ -103,6 +103,18 @@ public sealed class TraeModelCatalogTests
     }
 
     [TestMethod]
+    public void Parse_PreservesVariantContextWindows()
+    {
+        var config = Config("DeepSeek-V4-Flash", "DeepSeek-V4-Flash", "deepseek-v4-flash__dev", "deepseek-v4-flash__max");
+        config["context_window_tokens"] = new JsonObject { ["dev"] = 112000, ["max"] = 200000 };
+
+        var snapshot = TraeModelCatalogParser.Parse(Catalog(config));
+
+        snapshot.Models.Should().OnlyContain(model =>
+            model.DevContextWindow == 112000 && model.MaxContextWindow == 200000);
+    }
+
+    [TestMethod]
     public void Parse_SkipsDisabledHiddenAndInternalConfigurations()
     {
         var catalog = Catalog(

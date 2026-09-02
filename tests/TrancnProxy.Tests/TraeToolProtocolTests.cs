@@ -105,7 +105,7 @@ public sealed class TraeToolProtocolTests
     }
 
     [TestMethod]
-    public void ShouldForceToolUse_DoesNotRepeatAfterToolResult()
+    public void ShouldForceToolUse_StopsAfterRequestedToolCompletes()
     {
         var tools = new JsonArray(new JsonObject { ["name"] = "write_file" });
         var messages = new JsonArray(new JsonObject
@@ -119,6 +119,59 @@ public sealed class TraeToolProtocolTests
             })
         });
 
+        TraeToolProtocol.ShouldForceToolUse(messages, tools, new JsonObject { ["type"] = "auto" }).Should().BeFalse();
+    }
+
+    [TestMethod]
+    public void PreferredExecutionTool_SelectsWriteForFileCreation()
+    {
+        var tools = new JsonArray(
+            new JsonObject { ["name"] = "Read" },
+            new JsonObject { ["name"] = "Write" },
+            new JsonObject { ["name"] = "Bash" });
+        var messages = new JsonArray(new JsonObject
+        {
+            ["role"] = "user",
+            ["content"] = "在 /tmp 创建一个 H5 游戏，写完后读取"
+        });
+
+        TraeToolProtocol.PreferredExecutionTool(messages, tools).Should().Be("Write");
+    }
+
+    [TestMethod]
+    public void PreferredExecutionTool_SelectsOutstandingReadAfterWriteCompletes()
+    {
+        var tools = new JsonArray(
+            new JsonObject { ["name"] = "Write" },
+            new JsonObject { ["name"] = "Read" });
+        var messages = new JsonArray(
+            new JsonObject { ["role"] = "user", ["content"] = "创建 a.html，再使用 Read 读回" },
+            new JsonObject
+            {
+                ["role"] = "assistant",
+                ["content"] = new JsonArray(new JsonObject { ["type"] = "tool_use", ["name"] = "Write" })
+            },
+            new JsonObject
+            {
+                ["role"] = "user",
+                ["content"] = new JsonArray(new JsonObject { ["type"] = "tool_result", ["content"] = "created" })
+            });
+
+        TraeToolProtocol.PreferredExecutionTool(messages, tools).Should().Be("Read");
+        TraeToolProtocol.ShouldForceToolUse(messages, tools, new JsonObject { ["type"] = "auto" }).Should().BeTrue();
+
+        messages.Add(new JsonObject
+        {
+            ["role"] = "assistant",
+            ["content"] = new JsonArray(new JsonObject { ["type"] = "tool_use", ["name"] = "Read" })
+        });
+        messages.Add(new JsonObject
+        {
+            ["role"] = "user",
+            ["content"] = new JsonArray(new JsonObject { ["type"] = "tool_result", ["content"] = "read" })
+        });
+
+        TraeToolProtocol.PreferredExecutionTool(messages, tools).Should().BeNull();
         TraeToolProtocol.ShouldForceToolUse(messages, tools, new JsonObject { ["type"] = "auto" }).Should().BeFalse();
     }
 

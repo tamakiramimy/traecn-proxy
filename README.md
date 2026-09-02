@@ -8,12 +8,13 @@
 
 - 对话走企业控制面 `chat_v3` 通道直连上游，**精确选模有效**：代理会校验上游回传的实际模型 metadata，不一致时返回 `model_selection_mismatch`，不会静默回退到其他模型。
 - 支持多账号池（网页登录逐个添加）、会话粘滞、优先级/并发均衡调度、Token 自动刷新。
-- Anthropic Messages 已支持流式与非流式输出、上游 `reasoning_content` 到 thinking block 的映射，以及 `tool_use` / `tool_result`；已完成 Qwen 3.8 的 thinking、Markdown 代码块和单次工具调用 API 回归。
+- Anthropic Messages 已支持流式与非流式输出、`tool_use` / `tool_result`，并按模型分类 `reasoning_content`：GLM/Kimi/DeepSeek/Qwen 中的工具协议转为工具块，Markdown/代码转为正文，显式 `<think>` 才转为 thinking。
 - 已在 Linux 容器中实测可用：模型目录、精确选模、OpenAI / Anthropic 端点、流式输出、管理端逐模型测试。
 
 ## 能力与限制
 
 - OpenAI Responses 目前具备基础文本转发与流式封装，尚待 Codex 客户端端到端验证。
+- Anthropic `thinking.budget_tokens`、OpenAI `reasoning_effort` 与 Responses `reasoning.effort` 已映射到 Trae 的 `high` / `extra_high`；`adaptive` 保留 Trae 默认强度。字段已进入低层请求体，但仍需按模型做真实行为对照，不能仅凭 HTTP 成功认定上游已执行该强度。
 - Claude Desktop 与其他自动执行工具的客户端仍需进行受控长会话回归；代理会拒绝缺少 `input_schema.required` 参数的工具调用，避免将无效 `tool_use` 交给客户端反复执行。
 - 复杂多模态输入与完整 Anthropic 交错消息规则尚未覆盖。
 - SOLO / 消费版服务面（`solo_work_lite`）按 `config_name` 选模，与企业面的 `__dev` / `__max` ID 不通用，尚未做完整回归。
@@ -175,12 +176,21 @@ dotnet run -- --weblogin
 		"ChatApiHost": "",
 		"DefaultAccountKind": "auto",
 		"Enterprise": { "IdeVersion": "3.3.87", "IdeVersionCode": "20260806" },
-		"Solo": { "IdeVersion": "0.1.43", "IdeVersionCode": "20260716", "DeviceBrand": "83DG" }
+		"Solo": { "IdeVersion": "0.1.43", "IdeVersionCode": "20260716", "DeviceBrand": "83DG" },
+		"Reasoning": {
+			"ExtraHighBudgetThreshold": 8192,
+			"CarrierModelPatterns": [ "glm", "kimi", "deepseek", "qwen" ],
+			"NativeThinkingModelPatterns": []
+		}
 	}
 }
 ```
 
-留空的字段沿用内置默认值；企业面的设备信息默认取本机环境，SOLO 面固定使用该服务接受的 SOLO 客户端形态。
+留空的客户端画像字段沿用内置默认值；企业面的设备信息默认取本机环境，SOLO 面固定使用该服务接受的 SOLO 客户端形态。
+
+`ExtraHighBudgetThreshold` 是 Anthropic `enabled` thinking 从 `high` 切换到 `extra_high` 的阈值；大于阈值时使用 `extra_high`。`CarrierModelPatterns` 表示这些模型会把正文和工具协议承载在 `reasoning_content` 中，因此代理会重新分类；`NativeThinkingModelPatterns` 优先级更高，可把命中的模型强制恢复为原生 thinking 语义。
+
+模型 ID 为 `__max` 时，代理发送 `model_auto_selection.strategy=max`；`context_window_size` 仅使用模型目录明确给出的 `context_window_tokens.max`。普通 `__dev` 模型对应 `manual` 和目录中的 dev 窗口，不会把 DeepSeek-V4-Flash 的 112k/200k 硬套到其他模型。
 
 ## 命令行参数
 

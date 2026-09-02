@@ -28,6 +28,7 @@ public sealed record TraeThinkingEndBlock : TraeOutputBlock;
 
 public static class TraeToolProtocol
 {
+    public const int RequiredToolDraftLimit = 768;
     private const string OpenTag = "<tool_call>";
     private const string CloseTag = "</tool_call>";
     private static readonly (string Open, string Close)[] ThinkingTags =
@@ -368,13 +369,59 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
             .LastOrDefault(message => (string?)message["role"] == "user");
         if (lastUser is null) return false;
         if (lastUser["content"] is JsonArray blocks &&
-            blocks.OfType<JsonObject>().Any(block => (string?)block["type"] == "tool_result")) return false;
+            blocks.OfType<JsonObject>().Any(block => (string?)block["type"] == "tool_result"))
+            return PreferredExecutionTool(messages, tools) is not null;
 
         string text = ContentText(lastUser["content"]);
         bool chineseAction = ContainsAny(text, "创建", "新建", "生成", "写一个", "帮我写", "修改", "修复", "实现", "开发", "删除", "重命名", "移动", "运行", "执行", "安装", "测试", "检查", "搜索", "读取", "打开");
         bool chineseTarget = ContainsAny(text, "文件", "代码", "项目", "工作区", "应用", "页面", "网页", "脚本", "游戏", "网站", "组件", "接口", "命令", "H5", "h5");
         return (chineseAction || EnglishAction.IsMatch(text)) && (chineseTarget || EnglishTarget.IsMatch(text));
     }
+
+    public static string? PreferredExecutionTool(JsonArray? messages, JsonArray? tools)
+    {
+        JsonObject[] conversation = messages?.OfType<JsonObject>().ToArray() ?? [];
+        string text = string.Join("\n", conversation
+            .Where(message => (string?)message["role"] == "user" && !ContainsToolResult(message["content"]))
+            .Select(message => ContentText(message["content"])));
+        var usedTools = conversation
+            .Where(message => (string?)message["role"] == "assistant")
+            .SelectMany(message => (message["content"] as JsonArray)?.OfType<JsonObject>() ?? [])
+            .Where(block => (string?)block["type"] == "tool_use")
+            .Select(block => (string?)block["name"])
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        string[] names = tools?.OfType<JsonObject>()
+            .Select(tool => (string?)tool["name"])
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Select(name => name!)
+            .ToArray() ?? [];
+
+        string? Find(params string[] candidates) => names.FirstOrDefault(name =>
+            candidates.Any(candidate => name.Equals(candidate, StringComparison.OrdinalIgnoreCase)));
+
+        string? write = Find("Write", "write_file", "create_file");
+        if (write is not null && !usedTools.Contains(write) &&
+            ContainsAny(text, "创建", "新建", "生成", "写一个", "帮我写", "create", "write", "build", "implement"))
+            return write;
+        string? edit = Find("Edit", "edit_file", "apply_patch");
+        if (edit is not null && !usedTools.Contains(edit) &&
+            ContainsAny(text, "修改", "修复", "编辑", "modify", "edit", "fix"))
+            return edit;
+        string? read = Find("Read", "read_file");
+        if (read is not null && !usedTools.Contains(read) &&
+            ContainsAny(text, "读取", "读回", "查看文件", "read", "open"))
+            return read;
+        string? execute = Find("Bash", "run_in_terminal", "execute_command");
+        if (execute is not null && !usedTools.Contains(execute) &&
+            ContainsAny(text, "执行", "命令", "run command", "execute", "command"))
+            return execute;
+        return null;
+    }
+
+    private static bool ContainsToolResult(JsonNode? content) =>
+        content is JsonArray blocks &&
+        blocks.OfType<JsonObject>().Any(block => (string?)block["type"] == "tool_result");
 
     private static bool IsExecutionTool(string name)
     {
