@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
+using JsonRepairSharp;
 
 namespace TrancnProxy;
 
@@ -15,6 +16,9 @@ public sealed record TraeToolUseStartBlock(string Id, string Name) : TraeOutputB
 public sealed record TraeToolInputDeltaBlock(string PartialJson) : TraeOutputBlock;
 
 public sealed record TraeToolUseEndBlock : TraeOutputBlock;
+
+// 解析失败的工具调用绝不能当正文回给客户端，只能作为独立块交由上层记录并重试。
+public sealed record TraeToolCallFailureBlock(string ToolName, string Reason, string RawPayload) : TraeOutputBlock;
 
 public sealed record TraeThinkingStartBlock : TraeOutputBlock;
 
@@ -42,11 +46,25 @@ public static class TraeToolProtocol
     private static readonly Regex XmlToolWrapper = new(
         "</?(?:antml:)?(?:tool_calls|function_calls)\\s*>",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    // DeepSeek 会把原生 ｜DSML｜ 控制符漏进闭合标签，需容忍后再定位。
+    private static readonly Regex ToolCallClose = new(
+        "</\\s*(?:｜DSML｜\\s*)?tool_call\\s*>",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    // 控制符从不是合法参数内容，解析前先整体清掉。
+    private static readonly Regex DsmlNoise = new(
+        "</?\\s*｜DSML｜\\s*[A-Za-z_]*\\s*>|｜DSML｜",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex TrailingCloseTag = new(
+        "(?:\\s*</[^>]*>)+\\s*$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly Regex NumericParameter = new(
         @"^-?(?:0|[1-9]\d*)(?:\.\d+)?$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly Regex MalformedObjectSeparator = new(
         "(?<=[\"}])\\]\\[?\\s*(?=\"(?:name|arguments|input|parameters)\"\\s*:)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex ToolNameProperty = new(
+        "\"name\"\\s*:\\s*\"(?<name>[^\"]{1,120})\"",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly string[] PartialGuards =
     {
@@ -76,7 +94,7 @@ public static class TraeToolProtocol
         if (thinkingEnabled)
         {
             sections.Add("""
-    You MUST begin every response with exactly one non-empty <thinking>...</thinking> block containing a brief analysis summary, even for simple requests. The <thinking> opening tag MUST be the first output token. Only after the closing </thinking> tag may you emit the user-visible answer or a tool call. Do not place user-visible prose, Markdown, code, or tool calls inside that block.
+    Any reasoning you show must stay short. If you reason in the open, put it in exactly one <thinking>...</thinking> block before anything else, and never place user-visible prose, Markdown, code, or tool calls inside it. Do not draft the full solution inside that block; it is for a brief plan only. Never end your turn inside that block or immediately after it: once you close </thinking> you MUST still deliver the user-visible answer, and you MUST still emit any tool call the task requires.
 """);
         }
 
@@ -104,6 +122,164 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
         }
 
         return string.Join("\n\n", sections);
+    }
+
+    // 上游 JSON 常缺括号、多逗号或用单引号；标准解析失败后交给 jsonrepair，避免自行拼修复规则。
+    private static JsonObject? TryParseJsonObject(string text)
+    {
+        string normalized = MalformedObjectSeparator.Replace(text, ",");
+        try
+        {
+            if (JsonNode.Parse(normalized) is JsonObject direct) return direct;
+        }
+        catch (System.Text.Json.JsonException) { }
+
+        // 载荷在字符串中间断掉时，jsonrepair 会自己补上引号，结果是一个看似合法的半截文件，比直接失败更危险。
+        if (!EndsInsideString(normalized))
+        {
+            try
+            {
+                if (JsonNode.Parse(JsonRepair.RepairJson(normalized)) is JsonObject repaired) return repaired;
+            }
+            catch { }
+        }
+
+        return SalvageJsonObject(normalized);
+    }
+
+    private static bool EndsInsideString(string text)
+    {
+        bool inString = false, escaped = false;
+        foreach (char current in text)
+        {
+            if (inString)
+            {
+                if (escaped) escaped = false;
+                else if (current == '\\') escaped = true;
+                else if (current == '"') inString = false;
+                continue;
+            }
+            if (current == '"') inString = true;
+        }
+        return inString;
+    }
+
+    // jsonrepair 也救不回来时（实测：值后多出一个 ')'），逐个抢救顶层键值对。
+    // 只有干净走到 '}' 才算可信；中途读不出键说明字符串边界认错了（模型漏转义），宁可整体作废去重试，
+    // 也不能把半截文件当成合法参数交出去。
+    private static JsonObject? SalvageJsonObject(string text)
+    {
+        int cursor = text.IndexOf('{');
+        if (cursor < 0) return null;
+        cursor++;
+
+        var salvaged = new JsonObject();
+        while (cursor < text.Length)
+        {
+            cursor = SkipWhitespace(text, cursor);
+            if (cursor >= text.Length) return null;
+            if (text[cursor] == '}') return salvaged.Count > 0 ? salvaged : null;
+            if (text[cursor] == ',') { cursor++; continue; }
+            if (!TryReadJsonString(text, ref cursor, out string key)) return null;
+
+            cursor = SkipWhitespace(text, cursor);
+            if (cursor >= text.Length || text[cursor] != ':') return null;
+            cursor = SkipWhitespace(text, cursor + 1);
+
+            int valueEnd = JsonValueEnd(text, cursor);
+            if (valueEnd < 0) return null;
+            try { salvaged[key] = JsonNode.Parse(text[cursor..valueEnd]); }
+            catch (System.Text.Json.JsonException) { return null; }
+
+            cursor = valueEnd;
+            while (cursor < text.Length && text[cursor] != ',' && text[cursor] != '}') cursor++;
+        }
+        return null;
+    }
+
+    private static int JsonValueEnd(string text, int start)
+    {
+        if (start >= text.Length) return -1;
+        char opening = text[start];
+        if (opening == '{' || opening == '[') return BracketedValueEnd(text, start);
+        if (opening == '"')
+        {
+            int cursor = start;
+            return TryReadJsonString(text, ref cursor, out _) ? cursor : -1;
+        }
+
+        int end = start;
+        while (end < text.Length && text[end] != ',' && text[end] != '}' && text[end] != ']' && !char.IsWhiteSpace(text[end])) end++;
+        return end > start ? end : -1;
+    }
+
+    private static int BracketedValueEnd(string text, int start)
+    {
+        int depth = 0;
+        bool inString = false, escaped = false;
+        for (int index = start; index < text.Length; index++)
+        {
+            char current = text[index];
+            if (inString)
+            {
+                if (escaped) escaped = false;
+                else if (current == '\\') escaped = true;
+                else if (current == '"') inString = false;
+                continue;
+            }
+            if (current == '"') { inString = true; continue; }
+            if (current is '{' or '[') depth++;
+            else if (current is '}' or ']' && --depth == 0) return index + 1;
+        }
+        return -1;
+    }
+
+    private static bool TryReadJsonString(string value, ref int cursor, out string result)
+    {
+        result = "";
+        if (cursor >= value.Length || value[cursor] != '"') return false;
+        int start = cursor++;
+        bool escaped = false;
+        while (cursor < value.Length)
+        {
+            char current = value[cursor++];
+            if (escaped)
+            {
+                escaped = false;
+                continue;
+            }
+            if (current == '\\')
+            {
+                escaped = true;
+                continue;
+            }
+            if (current != '"') continue;
+            try { result = JsonNode.Parse(value[start..cursor])?.GetValue<string>() ?? ""; }
+            catch (System.Text.Json.JsonException) { return false; }
+            return true;
+        }
+        return false;
+    }
+
+    private static int SkipWhitespace(string value, int cursor)
+    {
+        while (cursor < value.Length && char.IsWhiteSpace(value[cursor])) cursor++;
+        return cursor;
+    }
+
+    public static bool TryParseArguments(string serialized, out JsonObject arguments)
+    {
+        arguments = new JsonObject();
+        if (string.IsNullOrWhiteSpace(serialized)) return true;
+        if (TryParseJsonObject(serialized) is not { } parsed) return false;
+        arguments = parsed;
+        return true;
+    }
+
+    private static string ToolNameHint(string payload)
+    {
+        Match match = ToolNameProperty.Match(payload);
+        return match.Success ? match.Groups["name"].Value : "unknown";
     }
 
     public static bool TryValidateToolUse(TraeToolUseBlock toolUse, JsonArray? tools, out string error)
@@ -222,6 +398,10 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
         private string _thinkingCloseTag = "";
         private bool _inXmlTool;
         private string _xmlToolCloseTag = "";
+        private int _argumentsDepth;
+        private bool _argumentsInString;
+        private bool _argumentsEscaped;
+        private bool _argumentsComplete;
 
         public StreamParser(bool streamToolCalls = false)
         {
@@ -293,7 +473,7 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
 
                 if (_inToolCall)
                 {
-                    int closeIndex = buffered.IndexOf(CloseTag, StringComparison.Ordinal);
+                    int closeIndex = FindCloseTag(buffered, out int closeLength);
                     if (_streamToolCalls && !_toolCallStarted && TryParseToolHeader(buffered, out string id, out string name, out int headerLength))
                     {
                         _buffer.Remove(0, headerLength);
@@ -308,67 +488,49 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
                         {
                             if (final)
                             {
-                                string finalRemainder = _buffer.ToString();
-                                if (_bareToolCall)
-                                {
-                                    int finalWrapperCloseIndex = LastNonWhitespaceIndex(finalRemainder);
-                                    if (finalWrapperCloseIndex >= 0 && finalRemainder[finalWrapperCloseIndex] == '}')
-                                        finalRemainder = finalRemainder.Remove(finalWrapperCloseIndex, 1);
-                                }
-                                if (finalRemainder.Length > 0) blocks.Add(new TraeToolInputDeltaBlock(finalRemainder));
+                                EmitToolArguments(blocks, _buffer.ToString());
                                 _buffer.Clear();
                                 blocks.Add(new TraeToolUseEndBlock());
                                 ResetToolCall();
                                 break;
                             }
 
-                            int deltaLength;
-                            if (_bareToolCall)
-                            {
-                                int finalJsonCharacter = LastNonWhitespaceIndex(buffered);
-                                deltaLength = Math.Max(0, finalJsonCharacter);
-                            }
-                            else
-                            {
-                                int toolBoundaryLength = PartialCloseTagLength(buffered) + 1;
-                                deltaLength = buffered.Length - toolBoundaryLength;
-                            }
+                            int deltaLength = _bareToolCall
+                                ? Math.Max(0, LastNonWhitespaceIndex(buffered))
+                                : buffered.Length - (PartialCloseTagLength(buffered) + 1);
                             if (deltaLength > 0)
                             {
-                                blocks.Add(new TraeToolInputDeltaBlock(buffered[..deltaLength]));
+                                EmitToolArguments(blocks, buffered[..deltaLength]);
                                 _buffer.Remove(0, deltaLength);
                             }
                             break;
                         }
 
-                        string remainder = buffered[..closeIndex];
-                        int wrapperCloseIndex = LastNonWhitespaceIndex(remainder);
-                        if (wrapperCloseIndex >= 0 && remainder[wrapperCloseIndex] == '}')
-                            remainder = remainder.Remove(wrapperCloseIndex, 1);
-                        if (remainder.Length > 0) blocks.Add(new TraeToolInputDeltaBlock(remainder));
-                        _buffer.Remove(0, closeIndex + CloseTag.Length);
+                        EmitToolArguments(blocks, buffered[..closeIndex]);
+                        _buffer.Remove(0, closeIndex + closeLength);
                         blocks.Add(new TraeToolUseEndBlock());
                         ResetToolCall();
                         continue;
                     }
 
-                    if (closeIndex < 0)
+                    if (TryTakeToolRegion(buffered, out string regionPayload, out int regionLength))
                     {
-                        if (final)
-                        {
-                            blocks.Add(new TraeTextBlock(OpenTag + buffered));
-                            _buffer.Clear();
-                            _inToolCall = false;
-                        }
-                        break;
+                        _buffer.Remove(0, regionLength);
+                        if (ParseToolUse(regionPayload) is { } toolUse) blocks.Add(toolUse);
+                        else blocks.Add(new TraeToolCallFailureBlock(ToolNameHint(regionPayload), "tool call payload is not valid JSON", regionPayload));
+                        ResetToolCall();
+                        continue;
                     }
 
-                    string payload = buffered[..closeIndex].Trim();
-                    _buffer.Remove(0, closeIndex + CloseTag.Length);
-                    if (ParseToolUse(payload) is { } toolUse) blocks.Add(toolUse);
-                    else blocks.Add(new TraeTextBlock(OpenTag + payload + CloseTag));
-                    ResetToolCall();
-                    continue;
+                    if (final)
+                    {
+                        // 闭合标签可能整个丢失，仍应尽量把缓冲区当成工具调用解析。
+                        if (ParseToolUse(buffered) is { } unterminated) blocks.Add(unterminated);
+                        else blocks.Add(new TraeToolCallFailureBlock(ToolNameHint(buffered), "tool call was truncated before it could be parsed", buffered));
+                        _buffer.Clear();
+                        _inToolCall = false;
+                    }
+                    break;
                 }
 
                 if (_streamToolCalls &&
@@ -455,6 +617,46 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
             _inToolCall = false;
             _toolCallStarted = false;
             _bareToolCall = false;
+            _argumentsDepth = 0;
+            _argumentsInString = false;
+            _argumentsEscaped = false;
+            _argumentsComplete = false;
+        }
+
+        // 模型经常漏写外层对象的收尾括号，只能按 JSON 深度判定 arguments 真正结束的位置。
+        private void EmitToolArguments(List<TraeOutputBlock> blocks, string text)
+        {
+            if (_argumentsComplete || text.Length == 0) return;
+            int end = ScanArgumentDepth(text);
+            string payload = end >= 0 ? text[..end] : text;
+            if (payload.Length > 0) blocks.Add(new TraeToolInputDeltaBlock(payload));
+        }
+
+        private int ScanArgumentDepth(string text)
+        {
+            for (int index = 0; index < text.Length; index++)
+            {
+                char current = text[index];
+                if (_argumentsInString)
+                {
+                    if (_argumentsEscaped) _argumentsEscaped = false;
+                    else if (current == '\\') _argumentsEscaped = true;
+                    else if (current == '"') _argumentsInString = false;
+                    continue;
+                }
+                if (current == '"') { _argumentsInString = true; continue; }
+                if (current is '{' or '[') _argumentsDepth++;
+                else if (current is '}' or ']')
+                {
+                    _argumentsDepth--;
+                    if (_argumentsDepth <= 0)
+                    {
+                        _argumentsComplete = true;
+                        return index + 1;
+                    }
+                }
+            }
+            return -1;
         }
 
         private static bool IsPotentialBareToolHeader(string value)
@@ -493,38 +695,6 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
             if (cursor >= value.Length || value[cursor++] != ':') return false;
             headerLength = SkipWhitespace(value, cursor);
             return headerLength < value.Length;
-        }
-
-        private static bool TryReadJsonString(string value, ref int cursor, out string result)
-        {
-            result = "";
-            if (cursor >= value.Length || value[cursor] != '"') return false;
-            int start = cursor++;
-            bool escaped = false;
-            while (cursor < value.Length)
-            {
-                char current = value[cursor++];
-                if (escaped)
-                {
-                    escaped = false;
-                    continue;
-                }
-                if (current == '\\')
-                {
-                    escaped = true;
-                    continue;
-                }
-                if (current != '"') continue;
-                result = JsonNode.Parse(value[start..cursor])?.GetValue<string>() ?? "";
-                return true;
-            }
-            return false;
-        }
-
-        private static int SkipWhitespace(string value, int cursor)
-        {
-            while (cursor < value.Length && char.IsWhiteSpace(value[cursor])) cursor++;
-            return cursor;
         }
 
         private static int LastNonWhitespaceIndex(string value)
@@ -568,19 +738,13 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
         {
             string trimmed = body.Trim();
             if (trimmed.Length == 0 || trimmed[0] != '{') return null;
-            try
-            {
-                if (JsonNode.Parse(MalformedObjectSeparator.Replace(trimmed, ",")) is not JsonObject parsed) return null;
-                JsonNode? arguments = parsed["arguments"] ?? parsed["input"] ?? parsed["parameters"];
-                if (arguments is JsonValue value && value.TryGetValue<string>(out string? serialized))
-                    arguments = JsonNode.Parse(serialized ?? "{}");
-                if (arguments is JsonObject argumentObject) return (JsonObject)argumentObject.DeepClone();
-                return parsed["name"] is not null ? new JsonObject() : parsed;
-            }
-            catch (System.Text.Json.JsonException)
-            {
-                return null;
-            }
+            if (TryParseJsonObject(trimmed) is not { } parsed) return null;
+
+            JsonNode? arguments = parsed["arguments"] ?? parsed["input"] ?? parsed["parameters"];
+            if (arguments is JsonValue value && value.TryGetValue<string>(out string? serialized))
+                arguments = TryParseJsonObject(serialized ?? "{}");
+            if (arguments is JsonObject argumentObject) return (JsonObject)argumentObject.DeepClone();
+            return parsed["name"] is not null ? new JsonObject() : parsed;
         }
 
         private static JsonNode? ParameterValue(string raw)
@@ -598,6 +762,13 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
 
         private static int PartialCloseTagLength(string value) => PartialTagLength(value, CloseTag);
 
+        private static int FindCloseTag(string value, out int length)
+        {
+            Match match = ToolCallClose.Match(value);
+            length = match.Success ? match.Length : 0;
+            return match.Success ? match.Index : -1;
+        }
+
         private static int PartialTagLength(string value, string tag)
         {
             int maximum = Math.Min(value.Length, tag.Length - 1);
@@ -610,22 +781,116 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
 
         private static TraeToolUseBlock? ParseToolUse(string payload)
         {
-            try
+            // 模型有时把同一个调用重复输出多份，只取第一个完整对象。
+            string cleaned = DsmlNoise.Replace(payload, " ");
+            if (ParseToolObject(FirstJsonObject(cleaned)) is { } tool) return BuildToolUse(tool);
+            return ParseToolObject(TrailingCloseTag.Replace(cleaned, "").TrimEnd()) is { } repaired
+                ? BuildToolUse(repaired)
+                : null;
+        }
+
+        private static TraeToolUseBlock? BuildToolUse(JsonObject tool)
+        {
+            string? name = (string?)tool["name"];
+            if (string.IsNullOrWhiteSpace(name)) return null;
+            string id = (string?)tool["id"] ?? $"toolu_{Guid.NewGuid():N}";
+            JsonNode? arguments = tool["arguments"] ?? tool["input"] ?? tool["parameters"];
+            if (arguments is JsonValue value && value.TryGetValue<string>(out string? serialized))
+                arguments = TryParseJsonObject(serialized ?? "{}");
+            // 部分模型把参数与 name 平铺在同一层，而不是包进 arguments。
+            if (arguments is not JsonObject) arguments = FlattenedArguments(tool);
+            return new TraeToolUseBlock(id, name, arguments as JsonObject ?? new JsonObject());
+        }
+
+        private static JsonObject? ParseToolObject(string? candidate) =>
+            string.IsNullOrWhiteSpace(candidate) ? null : TryParseJsonObject(candidate);
+
+        private static string? FirstJsonObject(string text)
+        {
+            int start = text.IndexOf('{');
+            if (start < 0) return null;
+            int end = JsonObjectEnd(text, start);
+            return end < 0 ? null : text[start..end];
+        }
+
+        private static int JsonObjectEnd(string text, int start)
+        {
+            int depth = 0;
+            bool inString = false, escaped = false;
+            for (int index = start; index < text.Length; index++)
             {
-                string normalizedPayload = MalformedObjectSeparator.Replace(payload, ",");
-                if (JsonNode.Parse(normalizedPayload) is not JsonObject tool) return null;
-                string? name = (string?)tool["name"];
-                if (string.IsNullOrWhiteSpace(name)) return null;
-                string id = (string?)tool["id"] ?? $"toolu_{Guid.NewGuid():N}";
-                JsonNode? arguments = tool["arguments"] ?? tool["input"] ?? tool["parameters"];
-                if (arguments is JsonValue value && value.TryGetValue<string>(out string? serialized))
-                    arguments = JsonNode.Parse(serialized ?? "{}");
-                return new TraeToolUseBlock(id, name, arguments as JsonObject ?? new JsonObject());
+                char current = text[index];
+                if (inString)
+                {
+                    if (escaped) escaped = false;
+                    else if (current == '\\') escaped = true;
+                    else if (current == '"') inString = false;
+                    continue;
+                }
+                if (current == '"') { inString = true; continue; }
+                if (current == '{') depth++;
+                else if (current == '}' && --depth == 0) return index + 1;
             }
-            catch
+            return -1;
+        }
+
+        // 模型的闭合标签名不可靠（见 </tool_request>、</｜DSML｜>），改按 JSON 对象边界切分整个调用区域。
+        private static bool TryTakeToolRegion(string buffered, out string payload, out int consumed)
+        {
+            payload = "";
+            consumed = 0;
+            int cursor = 0;
+            bool sawObject = false;
+            while (cursor < buffered.Length)
             {
-                return null;
+                cursor = SkipWhitespace(buffered, cursor);
+                if (cursor >= buffered.Length) break;
+                if (buffered[cursor] == '{')
+                {
+                    int end = JsonObjectEnd(buffered, cursor);
+                    if (end < 0)
+                    {
+                        // 对象未闭合：若后面已有闭合标签，就把标签前的内容交给括号补全逻辑。
+                        int tag = buffered.IndexOf("</", cursor, StringComparison.Ordinal);
+                        if (tag < 0) return false;
+                        if (!sawObject)
+                        {
+                            payload = buffered[cursor..tag];
+                            sawObject = true;
+                        }
+                        cursor = tag;
+                        continue;
+                    }
+                    if (!sawObject)
+                    {
+                        payload = buffered[cursor..end];
+                        sawObject = true;
+                    }
+                    cursor = end;
+                    continue;
+                }
+                if (buffered[cursor] == '<' && cursor + 1 < buffered.Length && buffered[cursor + 1] == '/')
+                {
+                    int close = buffered.IndexOf('>', cursor);
+                    if (close < 0) return false;
+                    cursor = close + 1;
+                    consumed = cursor;
+                    continue;
+                }
+                break;
             }
+            return sawObject && consumed > 0;
+        }
+
+        private static JsonObject FlattenedArguments(JsonObject tool)
+        {
+            var arguments = new JsonObject();
+            foreach (var property in tool)
+            {
+                if (property.Key is "name" or "id" or "arguments" or "input" or "parameters") continue;
+                arguments[property.Key] = property.Value?.DeepClone();
+            }
+            return arguments;
         }
     }
 }

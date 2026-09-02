@@ -1,0 +1,3 @@
+# tool: AskUserQuestion
+# source: deepseek-v4, 2026-09-01 —— DSML 控制符漏进闭合标签，参数与 name 平铺
+<tool_call>{"name":"AskUserQuestion","questions":[{"question":"玩法?","options":["A","B"]}]}</｜DSML｜tool_call>

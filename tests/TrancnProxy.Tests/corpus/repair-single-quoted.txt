@@ -1,0 +1,3 @@
+# tool: Read
+# source: 合成 —— jsonrepair 覆盖：单引号键值
+<tool_call>{'name':'Read','arguments':{'file_path':'/tmp/a.txt'}}</tool_call>

@@ -1,0 +1,5 @@
+# tool: AskUserQuestion
+# source: deepseek-v4, 2026-09-01 —— 用 <tool_call> 打开却用 </tool_request> 闭合
+先确认几个细节。
+
+<tool_call>{"name":"AskUserQuestion","questions":[{"question":"核心玩法?","options":["A","B"]}]}</tool_request>

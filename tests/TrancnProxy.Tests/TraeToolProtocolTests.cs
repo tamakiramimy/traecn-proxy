@@ -48,8 +48,9 @@ public sealed class TraeToolProtocolTests
             thinkingEnabled: true);
 
         prompt.Should().Contain("<thinking>").And.Contain("</thinking>");
-        prompt.Should().Contain("MUST begin every response").And.Contain("non-empty");
-        prompt.Should().Contain("first output token");
+        prompt.Should().Contain("must stay short");
+        prompt.Should().Contain("Do not draft the full solution");
+        prompt.Should().Contain("MUST still emit any tool call");
         prompt.Should().Contain("Markdown").And.Contain("fenced code blocks");
     }
 
@@ -401,6 +402,168 @@ public sealed class TraeToolProtocolTests
         var input = JsonNode.Parse(assembled)!.AsObject();
         input["file_path"]!.ToString().Should().Be("/tmp/mini.html");
         input["content"]!.ToString().Should().Be("hi");
+    }
+
+    [TestMethod]
+    public void StreamParser_KeepsArgumentsIntactWhenModelOmitsWrapperBrace()
+    {
+        // Observed in production: the model closed arguments but not the outer object,
+        // so blindly stripping the last '}' destroyed the arguments object itself.
+        const string payload = """<tool_call>{"name":"Bash","arguments":{"command":"ls -la /tmp","description":"List working directory contents"}</tool_call>""";
+        var parser = new TraeToolProtocol.StreamParser(streamToolCalls: true);
+
+        var blocks = parser.Push(payload).ToList();
+        blocks.AddRange(parser.Complete());
+
+        blocks.OfType<TraeToolUseStartBlock>().Single().Name.Should().Be("Bash");
+        string assembled = string.Concat(blocks.OfType<TraeToolInputDeltaBlock>().Select(b => b.PartialJson));
+        var input = JsonNode.Parse(assembled)!.AsObject();
+        input["command"]!.ToString().Should().Be("ls -la /tmp");
+        input["description"]!.ToString().Should().Be("List working directory contents");
+    }
+
+    [TestMethod]
+    public void StreamParser_DropsWrapperTailWithoutTouchingBracesInsideStrings()
+    {
+        // The command value contains braces and escaped quotes; only the wrapper tail may be dropped.
+        const string payload = """<tool_call>{"name":"Bash","arguments":{"command":"echo \"{a}\" && ls","description":"x"}}</tool_call>""";
+        var parser = new TraeToolProtocol.StreamParser(streamToolCalls: true);
+
+        var blocks = parser.Push(payload).ToList();
+        blocks.AddRange(parser.Complete());
+
+        string assembled = string.Concat(blocks.OfType<TraeToolInputDeltaBlock>().Select(b => b.PartialJson));
+        var input = JsonNode.Parse(assembled)!.AsObject();
+        input["command"]!.ToString().Should().Be("""echo "{a}" && ls""");
+        input["description"]!.ToString().Should().Be("x");
+    }
+
+    [TestMethod]
+    public void Parse_RecoversDsmlContaminatedCloseTagWithFlattenedArguments()
+    {
+        // Exact deepseek output: DSML token leaked into </tool_call> and the params sit next to "name".
+        const string payload = """<tool_call>{"name":"AskUserQuestion","questions":[{"question":"玩法?","options":["A","B"]}]}</｜DSML｜tool_call>""";
+
+        var blocks = TraeToolProtocol.Parse(payload);
+
+        var toolUse = blocks.OfType<TraeToolUseBlock>().Single();
+        toolUse.Name.Should().Be("AskUserQuestion");
+        toolUse.Input["questions"]!.AsArray().Should().HaveCount(1);
+        string visible = string.Concat(blocks.OfType<TraeTextBlock>().Select(b => b.Text));
+        visible.Should().NotContain("tool_call");
+        visible.Should().NotContain("AskUserQuestion");
+    }
+
+    [TestMethod]
+    public void Parse_RecoversDuplicatedToolCallSeparatedByDsmlMarkers()
+    {
+        // Observed deepseek output: same call emitted twice, split by </｜DSML｜>, id before name.
+        const string payload =
+            """<tool_call>{"id":"toolu_c1e4b0b9","name":"AskUserQuestion","questions":[{"question":"目标用户是谁?","options":["学龄前","小学生"]}]}</｜DSML｜>""" +
+            "\n" +
+            """{"id":"toolu_c1e4b0b9","name":"AskUserQuestion","arguments":{"questions":[{"question":"目标用户是谁?"}]}}</｜DSML｜>""" +
+            "\n</tool_call>";
+
+        var blocks = TraeToolProtocol.Parse(payload);
+
+        var toolUse = blocks.OfType<TraeToolUseBlock>().Single();
+        toolUse.Name.Should().Be("AskUserQuestion");
+        toolUse.Id.Should().Be("toolu_c1e4b0b9");
+        toolUse.Input["questions"]!.AsArray().Should().HaveCount(1);
+        toolUse.Input["questions"]![0]!["options"]!.AsArray().Should().HaveCount(2);
+
+        string visible = string.Concat(blocks.OfType<TraeTextBlock>().Select(b => b.Text));
+        visible.Should().NotContain("tool_call");
+        visible.Should().NotContain("DSML");
+        visible.Should().NotContain("AskUserQuestion");
+    }
+
+    [TestMethod]
+    public void Parse_RecoversToolCallWhenCloseTagIsMissingEntirely()
+    {
+        const string payload = """<tool_call>{"name":"AskUserQuestion","questions":[{"question":"玩法?"}]}</｜DSML｜>""";
+
+        var blocks = TraeToolProtocol.Parse(payload);
+
+        blocks.OfType<TraeToolUseBlock>().Single().Name.Should().Be("AskUserQuestion");
+        string.Concat(blocks.OfType<TraeTextBlock>().Select(b => b.Text)).Should().NotContain("tool_call");
+    }
+
+    [TestMethod]
+    public void Parse_RecoversWhenCloseTagNameDoesNotMatchOpenTag()
+    {
+        // Observed deepseek output: opened with <tool_call> but closed with </tool_request>.
+        const string payload =
+            "先确认几个细节。\n\n" +
+            """<tool_call>{"name":"AskUserQuestion","questions":[{"question":"核心玩法?","options":["A","B"]}]}</tool_request>""";
+
+        var blocks = TraeToolProtocol.Parse(payload);
+
+        blocks.OfType<TraeToolUseBlock>().Single().Name.Should().Be("AskUserQuestion");
+        string visible = string.Concat(blocks.OfType<TraeTextBlock>().Select(b => b.Text));
+        visible.Should().Contain("先确认几个细节");
+        visible.Should().NotContain("tool_call");
+        visible.Should().NotContain("tool_request");
+        visible.Should().NotContain("AskUserQuestion");
+    }
+
+    [TestMethod]
+    public void Parse_KeepsProseThatFollowsAToolCall()
+    {
+        const string payload = """<tool_call>{"name":"Read","arguments":{"file_path":"/tmp/a"}}</tool_call>接下来我会读取文件。""";
+
+        var blocks = TraeToolProtocol.Parse(payload);
+
+        blocks.OfType<TraeToolUseBlock>().Single().Name.Should().Be("Read");
+        string.Concat(blocks.OfType<TraeTextBlock>().Select(b => b.Text)).Should().Be("接下来我会读取文件。");
+    }
+
+    [TestMethod]
+    public void Parse_RepairsToolCallMissingOuterClosingBrace()
+    {
+        // Observed deepseek output: valid </tool_call> but the outer '}' was never emitted.
+        const string payload = """<tool_call>{"name":"AskUserQuestion","questions":[{"question":"玩法?","options":["A","B"]}]</tool_call>""";
+
+        var blocks = TraeToolProtocol.Parse(payload);
+
+        var toolUse = blocks.OfType<TraeToolUseBlock>().Single();
+        toolUse.Name.Should().Be("AskUserQuestion");
+        toolUse.Input["questions"]!.AsArray().Should().HaveCount(1);
+        string.Concat(blocks.OfType<TraeTextBlock>().Select(b => b.Text)).Should().NotContain("tool_call");
+    }
+
+    [TestMethod]
+    public void Parse_EmitsFailureBlockInsteadOfLeakingUnparseablePayload()
+    {
+        // 关键回归：解析不出来时绝不能把 API key、文件内容之类的原始载荷当正文吐给客户端。
+        const string payload = """<tool_call>totally not json, secret=sk-live-1234</tool_call>""";
+
+        var blocks = TraeToolProtocol.Parse(payload);
+
+        var failure = blocks.OfType<TraeToolCallFailureBlock>().Single();
+        failure.RawPayload.Should().Contain("sk-live-1234");
+        string.Concat(blocks.OfType<TraeTextBlock>().Select(b => b.Text)).Should().NotContain("sk-live-1234");
+    }
+
+    [TestMethod]
+    public void Parse_EmitsFailureBlockWhenToolCallIsTruncated()
+    {
+        var blocks = TraeToolProtocol.Parse("""<tool_call>{"nam""");
+
+        blocks.OfType<TraeToolCallFailureBlock>().Should().ContainSingle();
+        string.Concat(blocks.OfType<TraeTextBlock>().Select(b => b.Text)).Should().NotContain("tool_call");
+    }
+
+    [TestMethod]
+    public void TryParseArguments_RepairsMalformedArgumentJson()
+    {
+        TraeToolProtocol.TryParseArguments("""{"command":"ls",""", out JsonObject repaired).Should().BeTrue();
+        repaired["command"]!.ToString().Should().Be("ls");
+
+        TraeToolProtocol.TryParseArguments("", out JsonObject empty).Should().BeTrue();
+        empty.Should().BeEmpty();
+
+        TraeToolProtocol.TryParseArguments("not json at all", out _).Should().BeFalse();
     }
 
     [TestMethod]

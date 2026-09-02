@@ -1,0 +1,3 @@
+# tool: Read
+# source: 合成 —— jsonrepair 覆盖：对象与数组尾随逗号
+<tool_call>{"name":"Read","arguments":{"file_path":"/tmp/a.txt","lines":[1,2,],},}</tool_call>

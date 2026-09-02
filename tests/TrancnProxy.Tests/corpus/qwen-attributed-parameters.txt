@@ -1,0 +1,9 @@
+# tool: Write
+# source: qwen3.8-max, 2026-08-31 —— 属性式标签 + raw <parameter> 值，曾把 15KB HTML 泄漏成正文
+先重写文件：
+
+<tool_call name="Write">
+<parameter name="file_path">/tmp/whack_a_mole.html</parameter>
+<parameter name="content"><!DOCTYPE html>
+<html lang="zh"><body>hi</body></html></parameter>
+</tool_call>
