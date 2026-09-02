@@ -27,9 +27,10 @@ public class TraeToolCorpusTests
     [DynamicData(nameof(CorpusCases))]
     public void Replay_ParsesRecordedToolCallWithoutLeakingPayload(string fileName)
     {
-        (string expectedTool, string payload) = Load(Path.Combine(CorpusDirectory, fileName));
+        string path = Path.Combine(CorpusDirectory, fileName);
+        (string expectedTool, string payload) = Load(path);
 
-        var blocks = TraeToolProtocol.Parse(payload);
+        var blocks = TraeToolProtocol.Parse(payload, ToolSchema(path));
 
         blocks.OfType<TraeToolCallFailureBlock>().Should()
             .BeEmpty($"{fileName} 应能被解析为工具调用");
@@ -38,8 +39,32 @@ public class TraeToolCorpusTests
             .Should().Contain(expectedTool, $"{fileName} 声明的工具是 {expectedTool}");
 
         string visible = string.Concat(blocks.OfType<TraeTextBlock>().Select(block => block.Text));
-        visible.Should().NotContain("tool_call");
+        foreach (string marker in (string[])["tool_call", "tool_calls", "parameter", "arg_value", "function_call"])
+            visible.Should().NotContain(marker, $"{fileName} 不能把 <{marker}> 泄漏成正文");
         visible.Should().NotContain(expectedTool);
+    }
+
+    // 语料声明的工具定义，用于把 <arg_value> 这类匿名参数回填成真实参数名。
+    private static JsonArray? ToolSchema(string path)
+    {
+        string spec = Header(path, "# tools:");
+        if (spec.Length == 0) return null;
+
+        var tools = new JsonArray();
+        foreach (string entry in spec.Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            string[] parts = entry.Split(':', 2);
+            var required = new JsonArray();
+            if (parts.Length == 2)
+                foreach (string property in parts[1].Split(',', StringSplitOptions.RemoveEmptyEntries))
+                    required.Add(property.Trim());
+            tools.Add(new JsonObject
+            {
+                ["name"] = parts[0].Trim(),
+                ["input_schema"] = new JsonObject { ["required"] = required }
+            });
+        }
+        return tools;
     }
 
     public static IEnumerable<object[]> ArgumentCases =>
@@ -102,7 +127,8 @@ public class TraeToolCorpusTests
         (Header(path, "# tool:"), Body(path));
 
     private static string Header(string path, string prefix) =>
-        File.ReadLines(path).First(line => line.StartsWith(prefix, StringComparison.Ordinal))[prefix.Length..].Trim();
+        File.ReadLines(path).FirstOrDefault(line => line.StartsWith(prefix, StringComparison.Ordinal))
+            ?[prefix.Length..].Trim() ?? "";
 
     private static string Body(string path) =>
         string.Join("\n", File.ReadLines(path).Where(line => !line.StartsWith('#'))).Trim('\n');

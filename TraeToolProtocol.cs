@@ -36,16 +36,7 @@ public static class TraeToolProtocol
         ("<think>", "</think>")
     };
 
-    // 模型常以自身原生 XML 语法发起工具调用（DeepSeek 用全角 ｜DSML｜，Qwen 用带 name 属性的 tool_call），需与 <tool_call> JSON 一并识别。
-    private static readonly Regex XmlToolOpen = new(
-        "<(?<tag>｜DSML｜|antml:invoke|invoke|function_calls|function_call|function|tool_call)\\s+name\\s*=\\s*[\"'](?<name>[^\"']+)[\"'][^>]*>",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
-    private static readonly Regex XmlToolParameter = new(
-        "<parameter\\s+name\\s*=\\s*[\"'](?<key>[^\"']+)[\"'][^>]*>(?<value>.*?)</parameter>",
-        RegexOptions.Compiled | RegexOptions.Singleline | RegexOptions.CultureInvariant);
-    private static readonly Regex XmlToolWrapper = new(
-        "</?(?:antml:)?(?:tool_calls|function_calls)\\s*>",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    // 模型常以自身原生语法发起工具调用，标签名与属性顺序各家不同，统一交给 TraeXmlToolReader 扫描。
     // DeepSeek 会把原生 ｜DSML｜ 控制符漏进闭合标签，需容忍后再定位。
     private static readonly Regex ToolCallClose = new(
         "</\\s*(?:｜DSML｜\\s*)?tool_call\\s*>",
@@ -56,9 +47,6 @@ public static class TraeToolProtocol
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly Regex TrailingCloseTag = new(
         "(?:\\s*</[^>]*>)+\\s*$",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
-    private static readonly Regex NumericParameter = new(
-        @"^-?(?:0|[1-9]\d*)(?:\.\d+)?$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly Regex MalformedObjectSeparator = new(
         "(?<=[\"}])\\]\\[?\\s*(?=\"(?:name|arguments|input|parameters)\"\\s*:)",
@@ -434,33 +422,56 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
         return string.Join("\n", parts);
     }
 
-    public static IReadOnlyList<TraeOutputBlock> Parse(string text)
+    public static IReadOnlyList<TraeOutputBlock> Parse(string text, JsonArray? tools = null)
     {
-        var parser = new StreamParser();
+        var parser = new StreamParser(tools: tools);
         var blocks = parser.Push(text).ToList();
         blocks.AddRange(parser.Complete());
         return blocks;
+    }
+
+    // 匹配到工具定义才能把 <arg_value> 这类匿名参数回填成真实参数名。
+    internal static IReadOnlyDictionary<string, string[]> ToolRequirements(JsonArray? tools)
+    {
+        var requirements = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+        foreach (JsonObject tool in tools?.OfType<JsonObject>() ?? [])
+        {
+            if ((string?)tool["name"] is not { Length: > 0 } name) continue;
+            string[] ordered = (tool["input_schema"]?["required"] as JsonArray)?
+                .Select(node => (string?)node)
+                .Where(property => !string.IsNullOrWhiteSpace(property))
+                .Select(property => property!)
+                .ToArray() ?? [];
+            if (ordered.Length == 0 && tool["input_schema"]?["properties"] is JsonObject properties)
+                ordered = properties.Select(property => property.Key).ToArray();
+            requirements[name] = ordered;
+        }
+        return requirements;
     }
 
     public sealed class StreamParser
     {
         private readonly StringBuilder _buffer = new();
         private readonly bool _streamToolCalls;
+        private readonly IReadOnlyDictionary<string, string[]> _toolRequirements;
         private bool _inToolCall;
         private bool _toolCallStarted;
         private bool _bareToolCall;
+        private string _toolContainerTag = "tool_call";
         private bool _inThinking;
         private string _thinkingCloseTag = "";
         private bool _inXmlTool;
+        private string _xmlToolName = "";
         private string _xmlToolCloseTag = "";
         private int _argumentsDepth;
         private bool _argumentsInString;
         private bool _argumentsEscaped;
         private bool _argumentsComplete;
 
-        public StreamParser(bool streamToolCalls = false)
+        public StreamParser(bool streamToolCalls = false, JsonArray? tools = null)
         {
             _streamToolCalls = streamToolCalls;
+            _toolRequirements = ToolRequirements(tools);
         }
 
         public IReadOnlyList<TraeOutputBlock> Push(string chunk)
@@ -572,7 +583,19 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
                     {
                         _buffer.Remove(0, regionLength);
                         if (ParseToolUse(regionPayload) is { } toolUse) blocks.Add(toolUse);
+                        else if (ParseXmlToolUse(regionPayload) is { } xmlToolUse) blocks.Add(xmlToolUse);
                         else blocks.Add(new TraeToolCallFailureBlock(ToolNameHint(regionPayload), "tool call payload is not valid JSON", regionPayload));
+                        ResetToolCall();
+                        continue;
+                    }
+
+                    // 容器没带 name、body 是 XML 参数时（Form A 开标签配 Form B 内容），等闭合标签到齐再整体解析。
+                    if (TryTakeXmlToolRegion(buffered, out string xmlPayload, out int xmlLength))
+                    {
+                        _buffer.Remove(0, xmlLength);
+                        if (ParseToolUse(xmlPayload) is { } fromJson) blocks.Add(fromJson);
+                        else if (ParseXmlToolUse(xmlPayload) is { } recovered) blocks.Add(recovered);
+                        else blocks.Add(new TraeToolCallFailureBlock(ToolNameHint(xmlPayload), "tool call parameters could not be matched to a tool", xmlPayload));
                         ResetToolCall();
                         continue;
                     }
@@ -581,6 +604,7 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
                     {
                         // 闭合标签可能整个丢失，仍应尽量把缓冲区当成工具调用解析。
                         if (ParseToolUse(buffered) is { } unterminated) blocks.Add(unterminated);
+                        else if (ParseXmlToolUse(buffered) is { } unterminatedXml) blocks.Add(unterminatedXml);
                         else blocks.Add(new TraeToolCallFailureBlock(ToolNameHint(buffered), "tool call was truncated before it could be parsed", buffered));
                         _buffer.Clear();
                         _inToolCall = false;
@@ -613,7 +637,14 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
                     thinkingCloseTag = tag.Close;
                 }
 
-                if (thinkingIndex >= 0 && (openIndex < 0 || thinkingIndex < openIndex))
+                // 标签层不按固定形状匹配：容器标签进入工具模式，包装标签整体丢弃，其余（含 HTML）原样留作正文。
+                bool sawToolTag = TraeXmlToolReader.TryFindTag(
+                    buffered, 0,
+                    tag => TraeXmlToolReader.IsContainer(tag.Name) || TraeXmlToolReader.IsWrapper(tag.Name),
+                    out TraeXmlTag toolTag);
+                int toolTagIndex = sawToolTag ? toolTag.Start : -1;
+
+                if (thinkingIndex >= 0 && (toolTagIndex < 0 || thinkingIndex < toolTagIndex))
                 {
                     if (thinkingIndex > 0) blocks.Add(new TraeTextBlock(buffered[..thinkingIndex]));
                     _buffer.Remove(0, thinkingIndex + thinkingOpenTag.Length);
@@ -623,31 +654,40 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
                     continue;
                 }
 
+                if (sawToolTag)
+                {
+                    if (toolTag.Start > 0)
+                    {
+                        blocks.Add(new TraeTextBlock(buffered[..toolTag.Start]));
+                        _buffer.Remove(0, toolTag.Start);
+                        continue;
+                    }
+
+                    _buffer.Remove(0, toolTag.Length);
+                    if (TraeXmlToolReader.IsWrapper(toolTag.Name) || toolTag.Kind != TraeXmlTagKind.Open) continue;
+
+                    if (toolTag.Attribute("name") is { Length: > 0 } attributeName)
+                    {
+                        _inXmlTool = true;
+                        _xmlToolName = attributeName;
+                        _xmlToolCloseTag = $"</{toolTag.Name}>";
+                        blocks.Add(new TraeToolUseStartBlock(
+                            toolTag.Attribute("id") ?? $"toolu_{Guid.NewGuid():N}", attributeName));
+                    }
+                    else
+                    {
+                        _inToolCall = true;
+                        _toolContainerTag = toolTag.Name;
+                    }
+                    continue;
+                }
+
                 if (openIndex >= 0)
                 {
                     if (openIndex > 0) blocks.Add(new TraeTextBlock(buffered[..openIndex]));
                     _buffer.Remove(0, openIndex + OpenTag.Length);
                     _inToolCall = true;
-                    continue;
-                }
-
-                Match xmlTool = XmlToolOpen.Match(buffered);
-                Match xmlWrapper = XmlToolWrapper.Match(buffered);
-                bool wrapperFirst = xmlWrapper.Success && (!xmlTool.Success || xmlWrapper.Index < xmlTool.Index);
-                if (xmlTool.Success && !wrapperFirst)
-                {
-                    if (xmlTool.Index > 0) blocks.Add(new TraeTextBlock(buffered[..xmlTool.Index]));
-                    _buffer.Remove(0, xmlTool.Index + xmlTool.Length);
-                    _inXmlTool = true;
-                    _xmlToolCloseTag = $"</{xmlTool.Groups["tag"].Value}>";
-                    blocks.Add(new TraeToolUseStartBlock($"toolu_{Guid.NewGuid():N}", xmlTool.Groups["name"].Value));
-                    continue;
-                }
-
-                if (wrapperFirst)
-                {
-                    if (xmlWrapper.Index > 0) blocks.Add(new TraeTextBlock(buffered[..xmlWrapper.Index]));
-                    _buffer.Remove(0, xmlWrapper.Index + xmlWrapper.Length);
+                    _toolContainerTag = "tool_call";
                     continue;
                 }
 
@@ -774,19 +814,45 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
             return value.Length;
         }
 
-        private static void EmitXmlToolInput(List<TraeOutputBlock> blocks, string body)
+        private void EmitXmlToolInput(List<TraeOutputBlock> blocks, string body)
         {
-            var input = new JsonObject();
-            bool sawParameter = false;
-            foreach (Match parameter in XmlToolParameter.Matches(body))
-            {
-                sawParameter = true;
-                input[parameter.Groups["key"].Value] = ParameterValue(parameter.Groups["value"].Value);
-            }
-            // 部分模型在属性式标签内直接放 JSON 参数，而不是 <parameter> 子元素。
-            if (!sawParameter && TryParseArgumentObject(body) is { } jsonBody) input = jsonBody;
+            JsonObject input = TraeXmlToolReader.ReadParameters(body, SchemaOrder(_xmlToolName));
+            // 部分模型在属性式标签内直接放 JSON 参数，而不是子元素。
+            if (input.Count == 0 && TryParseArgumentObject(body) is { } jsonBody) input = jsonBody;
             blocks.Add(new TraeToolInputDeltaBlock(input.ToJsonString()));
             blocks.Add(new TraeToolUseEndBlock());
+        }
+
+        private string[] SchemaOrder(string toolName) =>
+            _toolRequirements.TryGetValue(toolName, out string[]? order) ? order : [];
+
+        // 闭合标签名不可靠（容器可能用 </tool_call>，也可能用外层的 </tool_calls>），只要出现任一容器/包装闭标签即视为区域结束。
+        private bool TryTakeXmlToolRegion(string buffered, out string payload, out int consumed)
+        {
+            payload = "";
+            consumed = 0;
+            if (buffered.TrimStart().StartsWith('{')) return false;
+
+            bool found = TraeXmlToolReader.TryFindTag(
+                buffered, 0,
+                tag => tag.Kind == TraeXmlTagKind.Close &&
+                       (TraeXmlToolReader.IsContainer(tag.Name) || TraeXmlToolReader.IsWrapper(tag.Name)),
+                out TraeXmlTag close);
+            if (!found) return false;
+
+            payload = buffered[..close.Start];
+            consumed = close.End;
+            return true;
+        }
+
+        // 容器没带 name 时，body 仍可能是完整的 XML 参数；工具名可由参数集合在 schema 中反查。
+        private TraeToolUseBlock? ParseXmlToolUse(string payload)
+        {
+            JsonObject parameters = TraeXmlToolReader.ReadParameters(payload, []);
+            if (parameters.Count == 0) return null;
+            return TraeXmlToolReader.InferToolName(parameters, _toolRequirements) is { } name
+                ? new TraeToolUseBlock($"toolu_{Guid.NewGuid():N}", name, parameters)
+                : null;
         }
 
         private static JsonObject? TryParseArgumentObject(string body)
@@ -800,19 +866,6 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
                 arguments = TryParseJsonObject(serialized ?? "{}");
             if (arguments is JsonObject argumentObject) return (JsonObject)argumentObject.DeepClone();
             return parsed["name"] is not null ? new JsonObject() : parsed;
-        }
-
-        private static JsonNode? ParameterValue(string raw)
-        {
-            string trimmed = raw.Trim();
-            if (trimmed.Length > 0 && (trimmed[0] == '{' || trimmed[0] == '['))
-            {
-                try { return JsonNode.Parse(trimmed); }
-                catch (System.Text.Json.JsonException) { }
-            }
-            if (trimmed is "true" or "false") return JsonValue.Create(trimmed == "true");
-            if (NumericParameter.IsMatch(trimmed)) return JsonNode.Parse(trimmed);
-            return JsonValue.Create(raw);
         }
 
         private static int PartialCloseTagLength(string value) => PartialTagLength(value, CloseTag);

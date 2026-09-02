@@ -231,29 +231,26 @@ app.Use(async (ctx, next) =>
     }
     catch (TraeModelSelectionException ex) when (!ctx.Response.HasStarted)
     {
-        ctx.Response.Clear();
-        ctx.Response.StatusCode = StatusCodes.Status502BadGateway;
-        await ctx.Response.WriteAsJsonAsync(new
-        {
-            error = new { message = ex.Message, type = "upstream_error", code = "model_selection_mismatch" }
-        });
+        await Fail(ctx, ex, "model_selection_mismatch");
     }
     catch (TraeIdeBridgeException ex) when (!ctx.Response.HasStarted)
     {
-        ctx.Response.Clear();
-        ctx.Response.StatusCode = StatusCodes.Status502BadGateway;
-        await ctx.Response.WriteAsJsonAsync(new
-        {
-            error = new { message = ex.Message, type = "upstream_error", code = "ide_bridge_error" }
-        });
+        await Fail(ctx, ex, "ide_bridge_error");
     }
     catch (Exception ex) when (ex is TraeUpstreamException or TraeIncompleteStreamException && !ctx.Response.HasStarted)
     {
+        await Fail(ctx, ex, "upstream_incomplete_response");
+    }
+
+    // 502 之前只写响应体不落日志，事后无法定位；这里补上，与流式的 [stream-abort] 对齐。
+    static async Task Fail(HttpContext ctx, Exception ex, string code)
+    {
+        Console.Error.WriteLine($"[request-abort] {code}: {ex.GetType().Name}: {ex.Message}");
         ctx.Response.Clear();
         ctx.Response.StatusCode = StatusCodes.Status502BadGateway;
         await ctx.Response.WriteAsJsonAsync(new
         {
-            error = new { message = ex.Message, type = "upstream_error", code = "upstream_incomplete_response" }
+            error = new { message = ex.Message, type = "upstream_error", code }
         });
     }
 });
@@ -893,7 +890,7 @@ async Task<JsonObject> CollectAnthropic(
             return null;
         }
 
-        foreach (TraeOutputBlock block in TraeToolProtocol.Parse(source))
+    foreach (TraeOutputBlock block in TraeToolProtocol.Parse(source, tools))
         {
             if (block is TraeThinkingDeltaBlock thinkingDelta && !hasNativeReasoning)
                 thinking.Append(thinkingDelta.Text);
@@ -1018,7 +1015,7 @@ async Task WriteAnthropicStream(
     int inputTokens = 0;
     int outputTokens = 0;
     string finishReason = "stop";
-    var toolParser = new TraeToolProtocol.StreamParser(streamToolCalls: true);
+    var toolParser = new TraeToolProtocol.StreamParser(streamToolCalls: true, tools: tools);
     string? pendingToolId = null;
     string? pendingToolName = null;
     var pendingToolInput = new StringBuilder();
@@ -1164,7 +1161,7 @@ async Task WriteAnthropicStream(
     // 失败的工具调用会中断整个会话，所以带着已产出的正文向上游追问一次，而不是把错误直接抛给客户端。
     async Task<bool> RunAttempt(IAsyncEnumerable<TraeSseEvent> source)
     {
-        toolParser = new TraeToolProtocol.StreamParser(streamToolCalls: true);
+        toolParser = new TraeToolProtocol.StreamParser(streamToolCalls: true, tools: tools);
         await foreach (var ev in TraeStreamHeartbeat.ReadAsync(
             source,
             cancellationToken => new ValueTask(WriteEvent("ping", new JsonObject { ["type"] = "ping" })),

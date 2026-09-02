@@ -1,0 +1,7 @@
+# tool: Write
+# tools: Write:file_path,content
+# source: 合成 —— 参数直接用真实参数名做元素名，且属性顺序颠倒
+<tool_call type="function" name="Write" id="abc">
+<file_path>/tmp/a.html</file_path>
+<content><!DOCTYPE html><html><body>hi</body></html></content>
+</tool_call>

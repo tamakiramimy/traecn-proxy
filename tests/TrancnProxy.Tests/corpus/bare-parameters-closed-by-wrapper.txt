@@ -1,0 +1,6 @@
+# tool: Bash
+# tools: Bash:command,description
+# source: 线上 2026-09-02 Claude Desktop —— <tool_call> 不带 name，body 是裸 <parameter>，外层用 </tool_calls> 收尾
+<tool_calls>
+<tool_call>
+<parameter name="command">wc -l /tmp/traecn-check.html</parameter><parameter name="description">统计文件行数</parameter></tool_calls>

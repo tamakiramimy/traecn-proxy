@@ -1,0 +1,7 @@
+# tool: Read
+# tools: Read:file_path
+# source: 线上 2026-09-02 Claude Desktop —— id 属性排在 name 之前，参数用 <arg_value> 匿名元素，闭合标签还多了一个
+<tool_call id="tool_4364c912c1c644c3a6e5d0a86683d676" name="Read">
+<arg_value>/tmp/traecn-check.html</arg_value>
+</tool_call>
+</tool_call>
