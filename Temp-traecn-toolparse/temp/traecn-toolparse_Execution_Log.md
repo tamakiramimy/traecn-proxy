@@ -133,3 +133,51 @@
 
 **5/5 通过。** 耗时普遍下降，因为不再把预算烧在推理里写代码。测试 106/106。
 
+## 2026-09-02 傍晚：降级校验修复 + 多轮验证
+
+### 模型降级校验（原「遗留问题 2」）
+先取证再动手：`--chat-models-raw` 导出上游原始目录后确认 **上游根本不声明真实后端模型名**
+（`ali-deepseek-v4-pro` / `trae_tob_*` / `seed-code-*` 在原始目录中出现均为 0 次），
+包含判定对部分 config 结构上就不可能成立。目录里还有 `enable_llm_error_model_degrade`，
+说明上游自带降级机制 —— 这条校验不能放宽。
+
+方案：默认拒绝行为一字不改，新增 `Upstream:ModelAliases` 人工核验白名单，显式登记后才放行：
+- `Doubao_1_6` → `trae_tob_seed-code-lite-dev-0602-fixed`
+- `Doubao-Seed-2.0-Code` → `seed-code-pro-0130-dev`
+
+单测覆盖「未登记必须拒绝、已登记才放行」；实测 `Doubao_1_6__dev` 已能正常返回。测试 107/107。
+
+### 多轮 agentic 验证（此前完全未覆盖的路径）
+Claude Desktop 当前未接入本代理（`claude_desktop_config.json` 仅 `{"deploymentMode":"3p"}`，
+`~/.claude/settings.json` 指向 `api.cortexflueo.com`，cc-switch 已无 trae 档位），
+未擅自改用户配置。改用 `agent_loop.py` 覆盖真实客户端最常走的路径：
+tool_use → 真实执行 → tool_result 回传 → 下一轮。
+
+任务：写 H5 游戏 → Read 读回确认 → FileStats 统计行数（最少 3 次工具往返）。
+
+| 模型 | 结果 | 轮次 | 工具序列 |
+| --- | --- | --- | --- |
+| GLM-5.3 | done | 4 | Write→Read→FileStats |
+| DeepSeek-V4-Pro | done | 4 | Write→**Write**→Read→FileStats（首次空参数被重试救回） |
+| DeepSeek-V4-Flash | done | 4 | Write→Read→FileStats |
+| Qwen3.8-Max | done | 3 | 两组完整调用 |
+| Kimi-K3 | 1 失败 / 2 成功 | — | 偶发「连续两次只输出推理」，复跑 2/2 通过 |
+
+全程 `tool_errors=0`，沙箱产物 `whack.html` 实际落盘。
+
+### 累计验证成绩
+- 单轮 3 轮 × 5 模型：15/15
+- 长任务 16K tokens × 5 模型：5/5
+- 多轮 agentic：6/7 次（唯一失败为上游偶发，重试已触发）
+
+### 部署
+镜像 `traecn-proxy:toolparse` v0.4.8 已更新到 10005，模型数 41，回滚点 `traecn-proxy-prev-20260902`。
+
+## 遗留问题（最新）
+1. **OpenAI / Responses 协议不解析工具调用**：只覆盖 Anthropic 路径，Codex 侧仍原文直通。
+2. **`max_tokens` / `thinking.budget_tokens` 未转发上游**；目录里有 `max_tokens: 16000` 声明，
+   是否透传需先探明上游字段。
+3. **Kimi-K3 多轮偶发只输出推理**：重试两次仍可能落空，需观察是否要提到 3 次。
+4. 排查时 `TRANCN_API_KEY` 被打印到终端，建议轮换。
+5. **仍未做 Claude Desktop 真实验证**，全部结论来自 HTTP 层。
+
