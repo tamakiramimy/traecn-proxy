@@ -25,6 +25,7 @@ string? dataDirectory = EmptyToNull(settings.Accounts.DataDirectory);
 string? importPath = null;
 string? publicBaseUrl = Environment.GetEnvironmentVariable("TRANCN_PUBLIC_BASE_URL") ?? EmptyToNull(settings.Server.PublicBaseUrl);
 string? protocolEvidenceDirectory = null;
+string? rawCatalogPath = null;
 string? chatApiHost = Environment.GetEnvironmentVariable("TRANCN_CHAT_API_HOST") ?? EmptyToNull(settings.Upstream.ChatApiHost);
 for (int i = 0; i < argsList.Count; i++)
 {
@@ -38,6 +39,7 @@ for (int i = 0; i < argsList.Count; i++)
     else if (argsList[i] == "--public-base-url" && i + 1 < argsList.Count) publicBaseUrl = argsList[++i];
     else if (argsList[i] == "--protocol-evidence-dir" && i + 1 < argsList.Count) protocolEvidenceDirectory = argsList[++i];
     else if (argsList[i] == "--chat-api-host" && i + 1 < argsList.Count) chatApiHost = argsList[++i];
+    else if (argsList[i] == "--chat-models-raw" && i + 1 < argsList.Count) rawCatalogPath = argsList[++i];
 }
 
 if (!string.IsNullOrWhiteSpace(protocolEvidenceDirectory) && IsWithinCurrentWorkspace(protocolEvidenceDirectory))
@@ -151,6 +153,11 @@ if (listChatModels)
     {
         Console.WriteLine($"--- 上游返回但被过滤 ({chatCatalog.Skipped.Count}) ---");
         foreach (string skipped in chatCatalog.Skipped) Console.WriteLine(skipped);
+    }
+    if (!string.IsNullOrEmpty(rawCatalogPath))
+    {
+        await File.WriteAllTextAsync(rawCatalogPath, (await modelLease.Client.GetRawModelCatalogAsync()).ToJsonString());
+        Console.WriteLine($"--- 原始目录已写入 {rawCatalogPath} ---");
     }
     return 0;
 }

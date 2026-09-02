@@ -58,10 +58,18 @@ public sealed class ProxySettings
         public ClientProfileSettings Enterprise { get; set; } = new();
         public ClientProfileSettings Solo { get; set; } = new();
 
+        /// <summary>
+        /// 人工核验过的“请求模型 -> 上游实际模型名”白名单。
+        /// 上游目录不声明真实后端模型名，默认的包含判定对部分 config 结构上就无法成立；
+        /// 在这里显式登记才放行，避免悳悳放宽降级拦截。
+        /// </summary>
+        public Dictionary<string, string[]> ModelAliases { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
         internal TraeUpstreamOptions ToOptions(string? chatApiHost) => new(
             chatApiHost,
             Enterprise.ToOverrides(),
-            Solo.ToOverrides());
+            Solo.ToOverrides(),
+            ModelAliases);
     }
 
     /// <summary>客户端画像覆盖项，留空表示沿用内置默认值。</summary>

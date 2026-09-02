@@ -195,6 +195,36 @@ public sealed class TraeReliabilityTests
         TraeAnthropicThinking.IsEnabled(JsonNode.Parse("{}")).Should().BeFalse();
     }
 
+    [TestMethod]
+    public async Task ChatStreamAsync_RejectsUnrelatedActualModelUnlessAliasIsApproved()
+    {
+        const string upstream =
+            "event: metadata\ndata: {\"model\":\"trae_tob_seed-code-lite-dev-0602-fixed\"}\n\n" +
+            "event: output\ndata: {\"response\":\"ok\"}\n\n" +
+            "event: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+
+        Func<Task> withoutAlias = async () =>
+        {
+            var client = CreateClient(new StaticResponseHandler(upstream));
+            await foreach (var _ in client.ChatStreamAsync(new[] { ("user", "ping") }, "Doubao_1_6__dev")) { }
+        };
+        await withoutAlias.Should().ThrowAsync<TraeModelSelectionException>();
+
+        var approved = new TraeUpstreamOptions(ModelAliases: new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Doubao_1_6"] = ["trae_tob_seed-code-lite-dev-0602-fixed"]
+        });
+        var aliased = new TraeClient(
+            new TraeAuthData { Token = "test-token", ApiHost = "https://upstream.example" },
+            httpMessageHandler: new StaticResponseHandler(upstream),
+            upstreamOptions: approved);
+
+        var events = new List<TraeSseEvent>();
+        await foreach (var streamEvent in aliased.ChatStreamAsync(new[] { ("user", "ping") }, "Doubao_1_6__dev"))
+            events.Add(streamEvent);
+        events.Select(streamEvent => streamEvent.Event).Should().Equal("metadata", "output", "done");
+    }
+
     private static TraeClient CreateClient(HttpMessageHandler handler) => new(
         new TraeAuthData { Token = "test-token", ApiHost = "https://upstream.example" },
         httpMessageHandler: handler);

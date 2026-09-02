@@ -51,7 +51,8 @@ public sealed record TraeClientProfileOverrides(
 public sealed record TraeUpstreamOptions(
     string? ChatApiHost = null,
     TraeClientProfileOverrides? EnterpriseProfile = null,
-    TraeClientProfileOverrides? SoloProfile = null);
+    TraeClientProfileOverrides? SoloProfile = null,
+    IReadOnlyDictionary<string, string[]>? ModelAliases = null);
 
 /// <summary>
 /// 描述一个服务面上互相绑定的协议决策：chat 通道、模型目录端点与解析器、客户端画像、默认模型。

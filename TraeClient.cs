@@ -40,6 +40,7 @@ public class TraeClient
     private readonly string _machineId;
     private readonly TraeAuthData _auth;
     private readonly TraeModelCatalogCache _modelCatalog;
+    private readonly IReadOnlyDictionary<string, string[]> _modelAliases;
 
     public TraeClient(
         TraeAuthData auth,
@@ -62,6 +63,7 @@ public class TraeClient
             ? BuildHttpClient()
             : new HttpClient(httpMessageHandler, disposeHandler: false) { Timeout = TimeSpan.FromMinutes(10) };
         _modelCatalog = new TraeModelCatalogCache(FetchModelCatalogAsync, parseCatalog: _face.ParseCatalog);
+        _modelAliases = upstreamOptions?.ModelAliases ?? new Dictionary<string, string[]>();
     }
 
     public string ApiHost => _apiHost;
@@ -155,6 +157,9 @@ public class TraeClient
     /// <returns>The current account's model catalog.</returns>
     public Task<TraeModelCatalogSnapshot> GetModelCatalogAsync(bool force = false, CancellationToken ct = default) =>
         _modelCatalog.GetAsync(force, ct);
+
+    /// <summary>Fetches the raw upstream catalog response for diagnostics.</summary>
+    public Task<JsonNode> GetRawModelCatalogAsync(CancellationToken ct = default) => FetchModelCatalogAsync(ct);
 
     /// <summary>Resolves an exact model ID in the current account's catalog.</summary>
     /// <param name="modelId">The exact upstream model ID.</param>
@@ -308,12 +313,24 @@ public class TraeClient
             {
                 receivedMetadata = true;
                 string? actualModel = (string?)payload?["model"];
-                if (!string.IsNullOrWhiteSpace(actualModel) && !MatchesRequestedModel(model, actualModel))
+                if (!string.IsNullOrWhiteSpace(actualModel) && !MatchesRequestedModel(model, actualModel) && !IsApprovedAlias(model, actualModel))
                     throw new TraeModelSelectionException(model, actualModel);
             }
             else if (frame.Event == "output" && !receivedMetadata)
                 throw new TraeUpstreamException("Trae 响应缺少模型 metadata，无法确认实际调用模型。");
         }
+    }
+
+    // 上游目录不声明真实后端模型名，部分 config 的实际模型与请求 ID 没有任何字面关系，
+    // 只能靠人工核验后显式登记，不能把包含判定放宽。
+    private bool IsApprovedAlias(string requestedModel, string actualModel)
+    {
+        foreach (string key in (string[])[requestedModel, StripVariant(requestedModel)])
+        {
+            if (!_modelAliases.TryGetValue(key, out string[]? approved)) continue;
+            if (approved.Any(alias => string.Equals(alias, actualModel, StringComparison.OrdinalIgnoreCase))) return true;
+        }
+        return false;
     }
 
     private static bool MatchesRequestedModel(string requestedModel, string actualModel)
