@@ -122,10 +122,11 @@ public static class TraeToolProtocol
             sections.Add(choiceInstruction + "\n" + """
 Reasoning is for a short plan only. Never draft the full file, code, or answer inside your reasoning; produce it once, in the tool call itself. A turn that ends after reasoning without a tool call or a visible answer is a failed turn.
 You have access to the tools described below. When a tool is needed, emit a tool call using one of the two forms below and do not describe the call as prose.
-Form A (preferred for short values) — one JSON object whose keys MUST be in this order, name first, arguments second:
-<tool_call>{"name":"tool_name","arguments":{"parameter":"value"}}</tool_call>
-Form B (use whenever a value is long or spans multiple lines, such as file contents or code) — raw values, so you never need to escape quotes or newlines:
-<tool_call name="tool_name"><parameter name="parameter">raw value</parameter></tool_call>
+Form A (preferred for short values) - one JSON object whose keys MUST be in this order, name first, arguments second:
+<tool_call>{"name":"TOOL_NAME","arguments":{"PARAM_NAME":"PARAM_VALUE"}}</tool_call>
+Form B (use whenever a value is long or spans multiple lines, such as file contents or code) - write the value literally between the tags, so you never need to escape quotes or newlines:
+<tool_call name="TOOL_NAME"><parameter name="PARAM_NAME">PARAM_VALUE</parameter></tool_call>
+TOOL_NAME, PARAM_NAME and PARAM_VALUE above are placeholders. Always replace all three with the real tool name, the real parameter name, and the real value. Emitting the placeholder text itself is a failure.
 Never mix the two forms in a single call, and never wrap a Form B value in JSON quoting.
 Every property listed in the tool's input_schema.required array MUST be present and non-empty. Never emit an empty arguments object when required properties exist.
 You may emit multiple tool_call blocks when calls can run in parallel. Tool definitions:
@@ -321,9 +322,24 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
         return match.Success ? match.Groups["name"].Value : "unknown";
     }
 
+    // 提示词里的占位符会被模型原样抄进参数（实测写出过内容为 "raw value" 的文件），必须当成无效调用拦下。
+    private static readonly string[] TemplatePlaceholders =
+        ["TOOL_NAME", "PARAM_NAME", "PARAM_VALUE", "raw value", "tool_name", "parameter"];
+
     public static bool TryValidateToolUse(TraeToolUseBlock toolUse, JsonArray? tools, out string error)
     {
         error = "";
+        string[] placeholders = toolUse.Input
+            .Where(property => property.Value is JsonValue value &&
+                              value.TryGetValue(out string? text) &&
+                              TemplatePlaceholders.Contains(text?.Trim(), StringComparer.Ordinal))
+            .Select(property => property.Key)
+            .ToArray();
+        if (placeholders.Length > 0)
+        {
+            error = $"arguments still contain template placeholders: {string.Join(", ", placeholders)}";
+            return false;
+        }
         if (tools is not { Count: > 0 }) return true;
 
         JsonObject? definition = tools

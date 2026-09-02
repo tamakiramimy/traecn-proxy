@@ -1271,7 +1271,7 @@ async Task WriteAnthropicStream(
     }
     catch (Exception ex) when (wroteAnything)
     {
-        Console.Error.WriteLine($"[stream-abort] {model}: {ex.GetType().Name}: {ex.Message}");
+        Console.Error.WriteLine($"[stream-abort] {model}: {ex}");
         await WriteEvent("error", new JsonObject
         {
             ["type"] = "error",
@@ -1308,10 +1308,9 @@ List<(string role, string text)> ToolRetryMessages(List<(string role, string tex
           "Do not draft the solution inside your reasoning this time -- reasoning is for a short plan only. " +
           "Think briefly, then immediately emit the tool call or the answer."
         : $"Your previous tool call could not be used ({reason}). Do not apologize and do not repeat any prose. " +
-          "Re-emit only that single tool call. If any value is long, multi-line, or contains quotes, use the raw form " +
-          "<tool_call name=\"...\"><parameter name=\"...\">raw value</parameter></tool_call> so nothing needs escaping; " +
-          "otherwise emit one complete <tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call> block with balanced braces " +
-          "and every required property present."));
+          "Re-emit only that single tool call, with every required property present and filled with real values. " +
+          "If a value is long, multi-line, or contains quotes, put it literally between " +
+          "<parameter name=\"...\"> and </parameter> instead of JSON-quoting it."));
     return retry;
 }
 

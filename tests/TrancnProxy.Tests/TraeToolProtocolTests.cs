@@ -577,7 +577,28 @@ public sealed class TraeToolProtocolTests
 
         string prompt = TraeToolProtocol.BuildSystemPrompt(null, tools);
 
-        prompt.Should().Contain("""<tool_call>{"name":"tool_name","arguments":{"parameter":"value"}}</tool_call>""");
-        prompt.Should().Contain("""<tool_call name="tool_name"><parameter name="parameter">raw value</parameter></tool_call>""");
+        prompt.Should().Contain("""<tool_call>{"name":"TOOL_NAME","arguments":{"PARAM_NAME":"PARAM_VALUE"}}</tool_call>""");
+        prompt.Should().Contain("""<tool_call name="TOOL_NAME"><parameter name="PARAM_NAME">PARAM_VALUE</parameter></tool_call>""");
+        // 模型抄过 "raw value" 并写进文件，占位符必须一眼看得出是占位符。
+        prompt.Should().NotContain("raw value");
+        prompt.Should().Contain("Emitting the placeholder text itself is a failure.");
+    }
+
+    [TestMethod]
+    public void TryValidateToolUse_RejectsUnsubstitutedTemplatePlaceholders()
+    {
+        var tools = new JsonArray(new JsonObject
+        {
+            ["name"] = "Write",
+            ["input_schema"] = new JsonObject { ["required"] = new JsonArray("file_path", "content") }
+        });
+        var toolUse = new TraeToolUseBlock("id", "Write", new JsonObject
+        {
+            ["file_path"] = "/tmp/a.html",
+            ["content"] = "raw value"
+        });
+
+        TraeToolProtocol.TryValidateToolUse(toolUse, tools, out string error).Should().BeFalse();
+        error.Should().Contain("placeholders").And.Contain("content");
     }
 }
