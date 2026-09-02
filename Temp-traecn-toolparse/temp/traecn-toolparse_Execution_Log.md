@@ -81,8 +81,55 @@
 - 提交 `50a01d8`（16 个文件，+922/-171），**未推送**，等你确认。
 
 ## 遗留问题（本次未处理）
-1. **长任务上游断流**：glm-5.3 两次请求各等 259s / 220s，全程只有 ping，最终 `upstream_error`，
-   零 `output` 事件。与工具解析无关，属上游流生命周期问题，昨天也复现过。
-2. **OpenAI / Responses 协议不解析工具调用**：本次改动只覆盖 Anthropic 路径，Codex 侧仍是原文直通。
-3. 排查时 `TRANCN_API_KEY` 被打印到终端，建议轮换。
+1. **OpenAI / Responses 协议不解析工具调用**：本次改动只覆盖 Anthropic 路径，Codex 侧仍是原文直通。
+2. **`Doubao_1_6` 被模型降级校验误杀**：其 display_name 实为 `Doubao-Seed-Code`，上游回
+   `trae_tob_seed-code-lite-dev-0602-fixed` 是对的。校验只比对 model id，未比对 display_name。
+   放宽与否需用户拍板（原始需求写明「不可放宽」）。
+3. **`max_tokens` / `thinking.budget_tokens` 未转发上游**，对 Trae 无约束力；是否透传需先探明字段。
+4. 排查时 `TRANCN_API_KEY` 被打印到终端，建议轮换。
+5. **未做 Claude Desktop 真实验证**，全部结论来自 curl。
+
+## 2026-09-02 下午：长任务专项
+
+### 断流定性（用户问「技术上能解决吗」）
+新增诊断后复现，拿到决定性证据：
+
+```
+[stream-abort] glm-5.3__dev: TraeUpstreamException: Trae 上游完成但未返回有效内容。
+```
+
+不是 `IncompleteStream`（网络断连），是上游**正常发 done 但零 output**。同请求第二次即成功
+→ 随机性问题 → 可重试。这是最安全的重试场景：下游未提交任何内容，重发零副作用。
+
+### 长任务三类真因
+| 现象 | 真因 | 处理 |
+| --- | --- | --- |
+| 数分钟只有 ping，最后 error | 上游 done 但零 output | 自动重发一次 |
+| 只有思考、无答案（GLM-5.3） | 58K 字符代码草稿写进 `reasoning_content`，烧光预算 | 系统提示禁止在推理里起草方案 + `sawAnswerContent` 判定后重试 |
+| 62KB HTML 被吞进 file_path | Form A JSON 与 Form B `<parameter>` 混写 | `SplitEmbeddedParameters` 按边界拆回各键 |
+
+### 新增支持的方言（全部来自线上日志）
+- `<function name="x">` 标签
+- `<parameter name="x" string="true">` 带额外属性
+- `<tool_call>Read{...}` 裸工具名开头
+- `<tool_call>Read a="1" />` 裸工具名 + XML 属性
+
+### 模型目录
+`--chat-models` 现在会列出被过滤项。结论：**GLM-5.3-Flash 不在企业 chat_v3 目录里**
+（26 个被过滤项中也没有），不是我们没跟上；目录全量透传，上游开通后 TTL 过期自动出现。
+
+### 终验（用户指定的 5 个常用模型）
+短任务 3 轮 × 5 模型 = **15/15**，零 tool-reject。
+
+长任务（16K tokens，完整 H5 游戏）修复前后对比：
+
+| 模型 | 修复前 | 修复后 |
+| --- | --- | --- |
+| GLM-5.3 | 244s，**tool=0**，think delta 1961 | 144s，tool=1，think delta **16** |
+| Qwen3.8-Max | 341s，tool=1 | 276s，tool=1（重试救回 1 次） |
+| Kimi-K3 | 292s，tool=1（重试救回 1 次） | 124s，tool=1 |
+| DeepSeek-V4-Pro | 102s，tool=1 | 105s，tool=1 |
+| DeepSeek-V4-Flash | 50s，tool=1 | 44s，tool=1 |
+
+**5/5 通过。** 耗时普遍下降，因为不再把预算烧在推理里写代码。测试 106/106。
 
