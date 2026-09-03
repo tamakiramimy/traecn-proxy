@@ -52,6 +52,52 @@ public sealed class TraeServiceFaceTests
     }
 
     [TestMethod]
+    public async Task ChatStream_PreservesMultimodalContentPartsInUpstreamPayload()
+    {
+        var handler = new CapturingHandler(Sse("kimi-k3"));
+        var client = new TraeClient(Auth(), httpMessageHandler: handler);
+        var messages = new[]
+        {
+            new TraeChatMessage("user", new[]
+            {
+                TraeChatContent.TextPart("before"),
+                TraeChatContent.Image("data:image/png;base64,AA=="),
+                TraeChatContent.TextPart("after")
+            })
+        };
+
+        await Drain(client.ChatStreamAsync(
+            messages,
+            new TraeModelDescriptor("kimi-k3__max", "kimi-k3", "Kimi K3", TraeModelVariant.Max)));
+
+        using var body = JsonDocument.Parse(handler.Body!);
+        var parts = body.RootElement.GetProperty("messages")[0].GetProperty("content");
+        parts.GetArrayLength().Should().Be(3);
+        parts[0].GetProperty("type").GetString().Should().Be("text");
+        parts[0].GetProperty("text").GetString().Should().Be("before");
+        parts[1].GetProperty("type").GetString().Should().Be("image_url");
+        parts[1].GetProperty("image_url").GetProperty("url").GetString()
+            .Should().Be("data:image/png;base64,AA==");
+        parts[2].GetProperty("text").GetString().Should().Be("after");
+    }
+
+    [TestMethod]
+    public void ImageContent_RejectsInvalidDataUrl()
+    {
+        FluentActions.Invoking(() => TraeChatContent.Image("data:image/png;base64,not-base64"))
+            .Should().Throw<TraeMultimodalInputException>();
+        FluentActions.Invoking(() => TraeChatContent.Image("data:image/svg+xml;base64,AA=="))
+            .Should().Throw<TraeMultimodalInputException>();
+    }
+
+    [TestMethod]
+    public void ImageContent_AllowsHttpUrl()
+    {
+        TraeChatContent.Image("https://images.example.test/probe.png").ImageUrl
+            .Should().Be("https://images.example.test/probe.png");
+    }
+
+    [TestMethod]
     public async Task EnterpriseFace_LoadsCatalogFromBatchEndpointOnControlPlane()
     {
         var handler = new CapturingHandler(EnterpriseCatalog(), "application/json");

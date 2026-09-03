@@ -86,16 +86,22 @@ public sealed class TraeOutputClassifierTests
     {
         var settings = new ProxySettings.ReasoningSettings
         {
-            CarrierModelPatterns = ["kimi"],
+            CarrierModelPatterns = ["kimi", "qwen"],
             NativeThinkingModelPatterns = [],
-            NativeThinkingWhenEnabledModelPatterns = ["kimi-k3"]
+            NativeThinkingWhenEnabledModelPatterns = ["kimi-k3", "qwen3.8-max"]
         };
         var model = new TraeModelDescriptor(
             "kimi-k3__max", "kimi-k3", "Kimi K3", TraeModelVariant.Max);
+        var qwenModel = new TraeModelDescriptor(
+            "qwen3.8-max__max", "qwen3.8-max", "Qwen 3.8 Max", TraeModelVariant.Max);
 
         settings.ResolvePresentation(model, thinkingEnabled: true)
             .Should().Be(TraeReasoningPresentation.NativeThinking);
         settings.ResolvePresentation(model, thinkingEnabled: false)
+            .Should().Be(TraeReasoningPresentation.Carrier);
+        settings.ResolvePresentation(qwenModel, thinkingEnabled: true)
+            .Should().Be(TraeReasoningPresentation.NativeThinking);
+        settings.ResolvePresentation(qwenModel, thinkingEnabled: false)
             .Should().Be(TraeReasoningPresentation.Carrier);
     }
 

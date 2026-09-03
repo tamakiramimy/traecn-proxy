@@ -251,6 +251,21 @@ public sealed class TraeReliabilityTests
     }
 
     [TestMethod]
+    public void AnthropicResponsePolicy_NoAnswerRecoveryDropsStaleReasoningAndReportsAccurately()
+    {
+        TraeAnthropicResponsePolicy.ShouldPreserveAssistantPartial(
+            TraeAnthropicResponsePolicy.NoAnswerReason).Should().BeFalse();
+
+        string message = TraeAnthropicResponsePolicy.ToolFailureMessage(
+            null,
+            TraeAnthropicResponsePolicy.NoAnswerReason);
+
+        message.Should().Contain("user-visible answer");
+        message.Should().NotContain("tool call");
+        message.Should().NotContain("invalid arguments");
+    }
+
+    [TestMethod]
     public void AnthropicResponsePolicy_RetryBudgetsAreIndependentByFailureReason()
     {
         var retryCounts = new Dictionary<string, int>();
@@ -268,6 +283,13 @@ public sealed class TraeReliabilityTests
             retryCounts, "missing required properties: file_path").Should().BeTrue();
         TraeAnthropicResponsePolicy.TryReserveRetry(
             retryCounts, "missing required properties: file_path").Should().BeFalse();
+
+        TraeAnthropicResponsePolicy.TryReserveRetry(
+            retryCounts, TraeAnthropicResponsePolicy.NoAnswerReason).Should().BeTrue();
+        TraeAnthropicResponsePolicy.TryReserveRetry(
+            retryCounts, TraeAnthropicResponsePolicy.NoAnswerReason).Should().BeTrue();
+        TraeAnthropicResponsePolicy.TryReserveRetry(
+            retryCounts, TraeAnthropicResponsePolicy.NoAnswerReason).Should().BeFalse();
     }
 
     [TestMethod]

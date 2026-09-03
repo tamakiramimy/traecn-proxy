@@ -30,7 +30,7 @@
 镜像支持 `linux/amd64` 和 `linux/arm64`：
 
 - `tamakiramimy/traecn-proxy:latest`：最新正式版本
-- `tamakiramimy/traecn-proxy:0.4.1`：固定版本
+- `tamakiramimy/traecn-proxy:0.5.0`：固定版本
 - `ghcr.io/tamakiramimy/traecn-proxy:latest`：Docker Hub 不可用时的备用源
 
 ### Docker Run

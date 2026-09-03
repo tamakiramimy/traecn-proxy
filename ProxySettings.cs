@@ -58,6 +58,7 @@ public sealed class ProxySettings
         public ClientProfileSettings Enterprise { get; set; } = new();
         public ClientProfileSettings Solo { get; set; } = new();
         public ReasoningSettings Reasoning { get; set; } = new();
+        public VisionSettings Vision { get; set; } = new();
 
         /// <summary>
         /// 人工核验过的“请求模型 -> 上游实际模型名”白名单。
@@ -73,12 +74,24 @@ public sealed class ProxySettings
             ModelAliases);
     }
 
+    public sealed class VisionSettings
+    {
+        public string[] ModelPatterns { get; set; } = ["kimi-k3", "qwen3.8-max"];
+
+        internal bool SupportsModel(TraeModelDescriptor model)
+        {
+            string identity = $"{model.Id}\n{model.ConfigName}\n{model.DisplayName}";
+            return ModelPatterns.Any(pattern =>
+                !string.IsNullOrWhiteSpace(pattern) && identity.Contains(pattern, StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
     public sealed class ReasoningSettings
     {
         public int ExtraHighBudgetThreshold { get; set; } = TraeChatTuning.DefaultExtraHighBudgetThreshold;
         public string[] CarrierModelPatterns { get; set; } = ["glm", "kimi", "deepseek", "qwen"];
         public string[] NativeThinkingModelPatterns { get; set; } = [];
-        public string[] NativeThinkingWhenEnabledModelPatterns { get; set; } = ["kimi-k3"];
+        public string[] NativeThinkingWhenEnabledModelPatterns { get; set; } = ["kimi-k3", "qwen3.8-max"];
 
         internal int ValidatedBudgetThreshold()
         {

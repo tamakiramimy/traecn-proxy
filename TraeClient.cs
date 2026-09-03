@@ -191,6 +191,12 @@ public class TraeClient
     public IAsyncEnumerable<TraeSseEvent> ChatStreamAsync(
         IEnumerable<(string role, string text)> messages, string model, CancellationToken ct = default)
     {
+        return ChatStreamAsync(messages.Select(message => TraeChatMessage.Text(message.role, message.text)), model, ct);
+    }
+
+    public IAsyncEnumerable<TraeSseEvent> ChatStreamAsync(
+        IEnumerable<TraeChatMessage> messages, string model, CancellationToken ct = default)
+    {
         return ChatStreamCore(messages, model, model, null, ct);
     }
 
@@ -201,6 +207,13 @@ public class TraeClient
     /// <returns>The upstream SSE events.</returns>
     public IAsyncEnumerable<TraeSseEvent> ChatStreamAsync(
         IEnumerable<(string role, string text)> messages, TraeModelDescriptor model, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(model);
+        return ChatStreamAsync(messages.Select(message => TraeChatMessage.Text(message.role, message.text)), model, ct);
+    }
+
+    public IAsyncEnumerable<TraeSseEvent> ChatStreamAsync(
+        IEnumerable<TraeChatMessage> messages, TraeModelDescriptor model, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(model);
         return ChatStreamCore(messages, model.Id, model.ConfigName, null, ct);
@@ -214,23 +227,30 @@ public class TraeClient
     {
         ArgumentNullException.ThrowIfNull(model);
         ArgumentNullException.ThrowIfNull(tuning);
+        return ChatStreamAsync(messages.Select(message => TraeChatMessage.Text(message.role, message.text)), model, tuning, ct);
+    }
+
+    public IAsyncEnumerable<TraeSseEvent> ChatStreamAsync(
+        IEnumerable<TraeChatMessage> messages,
+        TraeModelDescriptor model,
+        TraeChatTuning tuning,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(model);
+        ArgumentNullException.ThrowIfNull(tuning);
         return ChatStreamCore(messages, model.Id, model.ConfigName, tuning.ApplyModel(model), ct);
     }
 
     private async IAsyncEnumerable<TraeSseEvent> ChatStreamCore(
-        IEnumerable<(string role, string text)> messages,
+        IEnumerable<TraeChatMessage> messages,
         string model,
         string configName,
         TraeChatTuning? tuning,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
         var msgList = new JsonArray();
-        foreach (var (role, text) in messages)
-            msgList.Add(new JsonObject
-            {
-                ["role"] = role,
-                ["content"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = text })
-            });
+        foreach (TraeChatMessage message in messages)
+            msgList.Add(message.ToJson());
 
         string sessionId = Guid.NewGuid().ToString();
         var body = new JsonObject

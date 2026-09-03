@@ -1,18 +1,26 @@
 internal static class TraeAnthropicResponsePolicy
 {
     public const string RequiredToolMissingReason = "required tool was not called";
+    public const string NoAnswerReason = "no answer";
 
     public static bool ShouldBufferText(bool toolUseRequired, bool hasToolUse, bool isRecoveryMessage) =>
         toolUseRequired && !hasToolUse && !isRecoveryMessage;
 
     public static bool TryReserveRetry(IDictionary<string, int> retryCounts, string reason)
     {
-        int limit = reason == RequiredToolMissingReason ? 3 : 1;
+        int limit = reason switch
+        {
+            RequiredToolMissingReason => 3,
+            NoAnswerReason => 2,
+            _ => 1
+        };
         int count = retryCounts.TryGetValue(reason, out int current) ? current : 0;
         if (count >= limit) return false;
         retryCounts[reason] = count + 1;
         return true;
     }
+
+    public static bool ShouldPreserveAssistantPartial(string reason) => reason != NoAnswerReason;
 
     public static string ToolFailureMessage(string? toolName, string reason)
     {
@@ -21,6 +29,9 @@ internal static class TraeAnthropicResponsePolicy
             string requiredTool = string.IsNullOrWhiteSpace(toolName) ? "execution tool" : $"'{toolName}' tool";
             return $"The model did not call the required {requiredTool} after multiple attempts. Please retry the request.";
         }
+
+        if (reason == NoAnswerReason)
+            return "The model did not provide a user-visible answer after multiple attempts. Please retry the request.";
 
         return $"The tool call '{toolName}' was not executed because the model returned invalid arguments ({reason}). Please retry the request.";
     }

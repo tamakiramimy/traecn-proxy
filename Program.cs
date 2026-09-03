@@ -347,7 +347,9 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx) =>
     var body = JsonNode.Parse(await new StreamReader(ctx.Request.Body).ReadToEndAsync(ct))!.AsObject();
     string? requestedModel = (string?)body["model"];
     bool stream = body["stream"] is JsonValue sv && sv.TryGetValue<bool>(out var sb) && sb;
-    var messages = ConvertOpenAIMessages(body["messages"]?.AsArray());
+    List<TraeChatMessage> messages;
+    try { messages = ConvertOpenAIMessages(body["messages"]?.AsArray()); }
+    catch (TraeMultimodalInputException ex) { return InvalidMultimodalInput(ex); }
     if (messages.Count == 0)
         return Results.BadRequest(new { error = new { message = "messages is required", type = "invalid_request_error" } });
 
@@ -356,6 +358,8 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx) =>
     TraeModelDescriptor descriptor;
     try { descriptor = await lease.Client.ResolveModelAsync(model, ct); }
     catch (TraeModelNotFoundException) { return UnsupportedModel(model); }
+    if (messages.Any(message => message.HasImages) && !settings.Upstream.Vision.SupportsModel(descriptor))
+        return UnsupportedVisionModel(model);
     var upstream = ChatUpstream(lease, messages, descriptor, TraeChatTuning.FromOpenAI(body), ct);
     if (stream)
     {
@@ -373,7 +377,9 @@ app.MapPost("/v1/responses", async (HttpContext ctx) =>
     var body = JsonNode.Parse(await new StreamReader(ctx.Request.Body).ReadToEndAsync(ct))!.AsObject();
     string? requestedModel = (string?)body["model"];
     bool stream = body["stream"] is JsonValue sv && sv.TryGetValue<bool>(out var sb) && sb;
-    var messages = ConvertResponsesInput(body["input"]);
+    List<TraeChatMessage> messages;
+    try { messages = ConvertResponsesInput(body["input"]); }
+    catch (TraeMultimodalInputException ex) { return InvalidMultimodalInput(ex); }
     if (messages.Count == 0)
         return Results.BadRequest(new { error = new { message = "input is required", type = "invalid_request_error" } });
 
@@ -382,6 +388,8 @@ app.MapPost("/v1/responses", async (HttpContext ctx) =>
     TraeModelDescriptor descriptor;
     try { descriptor = await lease.Client.ResolveModelAsync(model, ct); }
     catch (TraeModelNotFoundException) { return UnsupportedModel(model); }
+    if (messages.Any(message => message.HasImages) && !settings.Upstream.Vision.SupportsModel(descriptor))
+        return UnsupportedVisionModel(model);
     var upstream = ChatUpstream(lease, messages, descriptor, TraeChatTuning.FromResponses(body), ct);
     string respId = $"resp_{Guid.NewGuid():N}";
     if (stream)
@@ -413,11 +421,18 @@ app.MapPost("/v1/messages", async (HttpContext ctx) =>
     try { descriptor = await lease.Client.ResolveModelAsync(model, ct); }
     catch (TraeModelNotFoundException) { return UnsupportedModel(model); }
     var presentation = settings.Upstream.Reasoning.ResolvePresentation(descriptor, thinkingEnabled);
-    var messages = ConvertAnthropicMessages(
-        body,
-        thinkingEnabled && presentation == TraeReasoningPresentation.NativeThinking);
+    List<TraeChatMessage> messages;
+    try
+    {
+        messages = ConvertAnthropicMessages(
+            body,
+            thinkingEnabled && presentation == TraeReasoningPresentation.NativeThinking);
+    }
+    catch (TraeMultimodalInputException ex) { return InvalidMultimodalInput(ex); }
     if (messages.Count == 0)
         return Results.BadRequest(new { type = "error", error = new { message = "messages is required", type = "invalid_request_error" } });
+    if (messages.Any(message => message.HasImages) && !settings.Upstream.Vision.SupportsModel(descriptor))
+        return UnsupportedVisionModel(model);
     var tuning = TraeChatTuning.FromAnthropic(
         body,
         settings.Upstream.Reasoning.ValidatedBudgetThreshold());
@@ -644,29 +659,24 @@ string? SessionKey(HttpContext ctx, JsonObject body)
     return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)));
 }
 
-List<(string role, string text)> ConvertOpenAIMessages(JsonArray? arr)
+List<TraeChatMessage> ConvertOpenAIMessages(JsonArray? arr)
 {
-    var result = new List<(string, string)>();
+    var result = new List<TraeChatMessage>();
     if (arr is null) return result;
     foreach (var m in arr)
     {
         var o = m?.AsObject();
         if (o is null) continue;
         string role = (string?)o["role"] ?? "user";
-        string text = o["content"] switch
-        {
-            JsonValue v when v.TryGetValue<string>(out var s) => s,
-            JsonArray parts => string.Join("\n", parts.Select(p => (string?)p?["text"] ?? "")),
-            _ => ""
-        };
-        if (!string.IsNullOrEmpty(text)) result.Add((role, text));
+        var content = ParseOpenAIContent(o["content"]);
+        if (content.Count > 0) result.Add(new TraeChatMessage(role, content));
     }
     return result;
 }
 
-List<(string role, string text)> ConvertAnthropicMessages(JsonObject body, bool thinkingEnabled)
+List<TraeChatMessage> ConvertAnthropicMessages(JsonObject body, bool thinkingEnabled)
 {
-    var result = new List<(string, string)>();
+    var result = new List<TraeChatMessage>();
     var tools = body["tools"] as JsonArray;
     JsonNode? toolChoice = body["tool_choice"];
     bool toolUseRequired = TraeToolProtocol.ShouldForceToolUse(body["messages"] as JsonArray, tools, toolChoice);
@@ -684,13 +694,92 @@ List<(string role, string text)> ConvertAnthropicMessages(JsonObject body, bool 
         toolChoice = new JsonObject { ["type"] = "any" };
     }
     string system = TraeToolProtocol.BuildSystemPrompt(body["system"], promptTools, toolChoice, thinkingEnabled);
-    if (!string.IsNullOrEmpty(system)) result.Add(("system", system));
+    if (!string.IsNullOrEmpty(system)) result.Add(TraeChatMessage.Text("system", system));
     foreach (var m in body["messages"]?.AsArray() ?? new JsonArray())
     {
         var o = m?.AsObject();
         if (o is null) continue;
         string role = (string?)o["role"] ?? "user";
-        result.Add((role == "assistant" ? "assistant" : "user", TraeToolProtocol.ContentText(o["content"])));
+        var content = ParseAnthropicContent(o["content"]);
+        if (content.Count > 0)
+            result.Add(new TraeChatMessage(role == "assistant" ? "assistant" : "user", content));
+    }
+    return result;
+}
+
+List<TraeChatContent> ParseOpenAIContent(JsonNode? content)
+{
+    if (content is JsonValue value && value.TryGetValue<string>(out string? scalarText))
+        return string.IsNullOrEmpty(scalarText) ? [] : [TraeChatContent.TextPart(scalarText)];
+    if (content is not JsonArray parts) return [];
+
+    var result = new List<TraeChatContent>();
+    foreach (JsonNode? node in parts)
+    {
+        if (node is not JsonObject part) continue;
+        string type = (string?)part["type"] ?? "text";
+        if (type is "text" or "input_text")
+        {
+            string? partText = (string?)part["text"];
+            if (!string.IsNullOrEmpty(partText)) result.Add(TraeChatContent.TextPart(partText));
+            continue;
+        }
+        if (type is "image_url" or "input_image")
+        {
+            string? imageUrl = type == "image_url"
+                ? (string?)part["image_url"]?["url"] ?? (string?)part["image_url"]
+                : (string?)part["image_url"] ?? (string?)part["source"]?["url"];
+            if (!string.IsNullOrWhiteSpace(imageUrl)) result.Add(TraeChatContent.Image(imageUrl));
+        }
+    }
+    return result;
+}
+
+List<TraeChatContent> ParseAnthropicContent(JsonNode? content)
+{
+    if (content is JsonValue value && value.TryGetValue<string>(out string? scalarText))
+        return string.IsNullOrEmpty(scalarText) ? [] : [TraeChatContent.TextPart(scalarText)];
+    if (content is not JsonArray blocks) return [];
+
+    var result = new List<TraeChatContent>();
+    foreach (JsonNode? node in blocks)
+    {
+        if (node is not JsonObject block) continue;
+        switch ((string?)block["type"])
+        {
+            case "text":
+                if ((string?)block["text"] is { Length: > 0 } blockText)
+                    result.Add(TraeChatContent.TextPart(blockText));
+                break;
+            case "image":
+                JsonObject? source = block["source"] as JsonObject;
+                string? sourceType = (string?)source?["type"];
+                string? mediaType = (string?)source?["media_type"];
+                string? data = (string?)source?["data"];
+                string? url = (string?)source?["url"];
+                if (sourceType == "base64" && !string.IsNullOrWhiteSpace(data) && !string.IsNullOrWhiteSpace(mediaType))
+                    result.Add(TraeChatContent.Image($"data:{mediaType};base64,{data}"));
+                else if (sourceType == "url" && !string.IsNullOrWhiteSpace(url))
+                    result.Add(TraeChatContent.Image(url));
+                break;
+            case "tool_result":
+                var nestedContent = ParseAnthropicContent(block["content"]);
+                string nestedText = string.Join("\n", nestedContent
+                    .Where(part => part.Type == "text")
+                    .Select(part => part.Text));
+                var textOnlyResult = (JsonObject)block.DeepClone();
+                textOnlyResult["content"] = string.IsNullOrEmpty(nestedText) && nestedContent.Any(part => part.Type == "image_url")
+                    ? "[image attached]"
+                    : nestedText;
+                string toolResultText = TraeToolProtocol.ContentText(new JsonArray(textOnlyResult));
+                if (!string.IsNullOrEmpty(toolResultText)) result.Add(TraeChatContent.TextPart(toolResultText));
+                result.AddRange(nestedContent.Where(part => part.Type == "image_url"));
+                break;
+            default:
+                string flattened = TraeToolProtocol.ContentText(new JsonArray(block.DeepClone()));
+                if (!string.IsNullOrEmpty(flattened)) result.Add(TraeChatContent.TextPart(flattened));
+                break;
+        }
     }
     return result;
 }
@@ -716,7 +805,7 @@ string ContentOf(JsonNode? content) => content switch
 // 企业面与独立 chat 面均已可直连，IDE Bridge 不再参与对话。
 IAsyncEnumerable<TraeSseEvent> ChatUpstream(
     AccountLease lease,
-    List<(string role, string text)> messages,
+    List<TraeChatMessage> messages,
     TraeModelDescriptor descriptor,
     TraeChatTuning tuning,
     CancellationToken ct) =>
@@ -729,6 +818,26 @@ IResult UnsupportedModel(string model) => Results.BadRequest(new
         message = $"model '{model}' is not available in the current TRAE account catalog; query /v1/models for exact IDs.",
         type = "invalid_request_error",
         code = "model_not_supported"
+    }
+});
+
+IResult UnsupportedVisionModel(string model) => Results.BadRequest(new
+{
+    error = new
+    {
+        message = $"model '{model}' does not support image input; use kimi-k3 or qwen3.8-max.",
+        type = "invalid_request_error",
+        code = "vision_not_supported"
+    }
+});
+
+IResult InvalidMultimodalInput(TraeMultimodalInputException exception) => Results.BadRequest(new
+{
+    error = new
+    {
+        message = exception.Message,
+        type = "invalid_request_error",
+        code = "invalid_image_input"
     }
 });
 
@@ -887,6 +996,7 @@ async Task<JsonObject> CollectAnthropic(
     bool hasAnswerContent = false;
     var thinking = new StringBuilder();
     var transcript = new StringBuilder();
+    var reasoningPreview = new TraeReasoningPreview();
 
     void AddText(string text, bool isRecoveryMessage = false)
     {
@@ -941,8 +1051,15 @@ async Task<JsonObject> CollectAnthropic(
             {
                 if (block is TraeThinkingDeltaBlock thinkingDelta && thinkingEnabled)
                 {
-                    thinking.Append(thinkingDelta.Text);
-                    if (toolUseRequired && !hasToolUse) transcript.Append(thinkingDelta.Text);
+                    string visibleThinking = thinkingDelta.Text;
+                    if (toolUseRequired && !hasToolUse)
+                    {
+                        transcript.Append(thinkingDelta.Text);
+                        visibleThinking = reasoningPreview.Push(thinkingDelta.Text);
+                    }
+                    thinking.Append(visibleThinking);
+                    if (toolUseRequired && !hasToolUse && reasoningPreview.Stopped)
+                        return (requiredToolName ?? "tool", TraeAnthropicResponsePolicy.RequiredToolMissingReason);
                 }
                 else if (block is TraeThinkingEndBlock)
                     FlushThinking();
@@ -1004,6 +1121,7 @@ async Task<JsonObject> CollectAnthropic(
     for (;;)
     {
         if (toolUseRequired && !hasToolUse) transcript.Clear();
+        reasoningPreview = new TraeReasoningPreview();
         var failure = AppendResult(result);
         if (failure is null && hasAnswerContent && (!toolUseRequired || hasToolUse)) break;
         string reason = failure?.Reason ?? (toolUseRequired && !hasToolUse
@@ -1015,6 +1133,8 @@ async Task<JsonObject> CollectAnthropic(
                 AddText(TraeAnthropicResponsePolicy.ToolFailureMessage(invalid.ToolName, invalid.Reason), isRecoveryMessage: true);
             else if (toolUseRequired && !hasToolUse)
                 AddText(TraeAnthropicResponsePolicy.ToolFailureMessage(requiredToolName, reason), isRecoveryMessage: true);
+            else
+                AddText(TraeAnthropicResponsePolicy.ToolFailureMessage(null, reason), isRecoveryMessage: true);
             break;
         }
         string? toolName = failure?.ToolName ?? requiredToolName;
@@ -1288,12 +1408,25 @@ async Task WriteAnthropicStream(
         else if (block is TraeThinkingDeltaBlock thinkingDelta && blockType == "thinking" && thinkingEnabled)
         {
             if (string.IsNullOrEmpty(thinkingDelta.Text)) return;
-            if (toolUseRequired && !sawToolUse) transcript.Append(thinkingDelta.Text);
-            await WriteEvent("content_block_delta", new JsonObject
+            string visibleThinking = thinkingDelta.Text;
+            if (toolUseRequired && !sawToolUse)
             {
-                ["type"] = "content_block_delta", ["index"] = blockIndex,
-                ["delta"] = new JsonObject { ["type"] = "thinking_delta", ["thinking"] = thinkingDelta.Text }
-            });
+                transcript.Append(thinkingDelta.Text);
+                visibleThinking = reasoningPreview.Push(thinkingDelta.Text);
+            }
+            if (!string.IsNullOrEmpty(visibleThinking))
+            {
+                await WriteEvent("content_block_delta", new JsonObject
+                {
+                    ["type"] = "content_block_delta", ["index"] = blockIndex,
+                    ["delta"] = new JsonObject { ["type"] = "thinking_delta", ["thinking"] = visibleThinking }
+                });
+            }
+            if (toolUseRequired && !sawToolUse && reasoningPreview.Stopped)
+            {
+                await CloseBlock();
+                pendingRetry ??= (requiredToolName, TraeAnthropicResponsePolicy.RequiredToolMissingReason);
+            }
         }
         else if (block is TraeThinkingEndBlock && blockType == "thinking" && thinkingEnabled)
         {
@@ -1352,7 +1485,7 @@ async Task WriteAnthropicStream(
                 }
                 if (!sawAnswerContent)
                 {
-                    pendingRetry ??= (null, sawUpstreamContent ? "no answer" : "no content");
+                    pendingRetry ??= (null, sawUpstreamContent ? TraeAnthropicResponsePolicy.NoAnswerReason : "no content");
                     return false;
                 }
                 if (j?["finish_reason"] is JsonValue doneReason &&
@@ -1381,8 +1514,11 @@ async Task WriteAnthropicStream(
                 failed.ToolName,
                 failedReason));
         }
-        if (!completed && pendingRetry is { } unrecovered)
+        if (!completed)
         {
+            var unrecovered = pendingRetry ?? (
+                requiredToolName,
+                sawUpstreamContent ? TraeAnthropicResponsePolicy.NoAnswerReason : "no content");
             pendingRetry = null;
             if (unrecovered.Reason is { } reason)
                 await WriteBlock(
@@ -1428,22 +1564,22 @@ void LogRejectedToolCall(string toolName, string error, string payload)
     TraeToolCorpus.Record(toolName, error, payload);
 }
 
-List<(string role, string text)> ToolRetryMessages(List<(string role, string text)> messages, string assistantPartial, string? toolName, string? reason)
+List<TraeChatMessage> ToolRetryMessages(List<TraeChatMessage> messages, string assistantPartial, string? toolName, string? reason)
 {
     // reason 为空表示上游本次什么都没吐，原样重发即可。
     if (reason is null) return messages;
 
-    var retry = new List<(string role, string text)>(messages);
-    if (!string.IsNullOrWhiteSpace(assistantPartial)) retry.Add(("assistant", assistantPartial));
-        retry.Add(("user", reason == TraeAnthropicResponsePolicy.RequiredToolMissingReason
+    var retry = new List<TraeChatMessage>(messages);
+    if (!string.IsNullOrWhiteSpace(assistantPartial) && TraeAnthropicResponsePolicy.ShouldPreserveAssistantPartial(reason))
+        retry.Add(TraeChatMessage.Text("assistant", assistantPartial));
+        retry.Add(TraeChatMessage.Text("user", reason == TraeAnthropicResponsePolicy.RequiredToolMissingReason
                 ? "The preceding assistant message already completed the reasoning for this task. Do not reason, plan, explain, preview, or repeat it again. " +
                     "Your entire next response MUST begin immediately with exactly one tool call " +
                     (toolName is null ? "using the required execution tool. " : $"using the '{toolName}' tool. ") +
                     "Start immediately with <tool_call and put the real complete content only inside that tool call."
                 : toolName is null
-                ? "Your previous attempt produced no answer: you reasoned at length but never emitted user-visible output or a tool call. " +
-          "Do not draft the solution inside your reasoning this time -- reasoning is for a short plan only. " +
-          "Think briefly, then immediately emit the tool call or the answer."
+                ? "Your previous attempt produced no user-visible answer. Treat unfinished work from earlier turns as complete and answer only the most recent user message. " +
+                    "Do not reason, plan, mention tools, or call a tool unless the latest message explicitly requires one. Output only the final answer now."
         : $"Your previous tool call could not be used ({reason}). Do not apologize and do not repeat any prose. " +
           "Re-emit only that single tool call, with every required property present and filled with real values. " +
           "If a value is long, multi-line, or contains quotes, put it literally between " +
@@ -1451,23 +1587,17 @@ List<(string role, string text)> ToolRetryMessages(List<(string role, string tex
     return retry;
 }
 
-List<(string role, string text)> ConvertResponsesInput(JsonNode? input) => input switch
+List<TraeChatMessage> ConvertResponsesInput(JsonNode? input) => input switch
 {
-    JsonValue v when v.TryGetValue<string>(out var s) => new List<(string, string)> { ("user", s) },
+    JsonValue v when v.TryGetValue<string>(out var s) => new List<TraeChatMessage> { TraeChatMessage.Text("user", s) },
     JsonArray arr => arr.Select(m =>
     {
         var o = m?.AsObject();
-        if (o is null) return ("user", "");
+        if (o is null) return new TraeChatMessage("user", []);
         string role = (string?)o["role"] ?? "user";
-        string text = o["content"] switch
-        {
-            JsonValue cv when cv.TryGetValue<string>(out var cs) => cs,
-            JsonArray parts => string.Join("\n", parts.Select(pt => (string?)pt?["text"] ?? "")),
-            _ => ""
-        };
-        return (role, text);
-    }).Where(x => !string.IsNullOrEmpty(x.Item2)).ToList(),
-    _ => new List<(string, string)>()
+        return new TraeChatMessage(role, ParseOpenAIContent(o["content"]));
+    }).Where(message => message.Content.Count > 0).ToList(),
+    _ => new List<TraeChatMessage>()
 };
 
 async Task<JsonObject> CollectResponses(IAsyncEnumerable<TraeSseEvent> upstream, string model, string respId, CancellationToken ct)
