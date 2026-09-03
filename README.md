@@ -180,7 +180,8 @@ dotnet run -- --weblogin
 		"Reasoning": {
 			"ExtraHighBudgetThreshold": 8192,
 			"CarrierModelPatterns": [ "glm", "kimi", "deepseek", "qwen" ],
-			"NativeThinkingModelPatterns": []
+			"NativeThinkingModelPatterns": [],
+			"NativeThinkingWhenEnabledModelPatterns": [ "kimi-k3" ]
 		}
 	}
 }
@@ -188,7 +189,7 @@ dotnet run -- --weblogin
 
 留空的客户端画像字段沿用内置默认值；企业面的设备信息默认取本机环境，SOLO 面固定使用该服务接受的 SOLO 客户端形态。
 
-`ExtraHighBudgetThreshold` 是 Anthropic `enabled` thinking 从 `high` 切换到 `extra_high` 的阈值；大于阈值时使用 `extra_high`。`CarrierModelPatterns` 表示这些模型会把正文和工具协议承载在 `reasoning_content` 中，因此代理会重新分类；`NativeThinkingModelPatterns` 优先级更高，可把命中的模型强制恢复为原生 thinking 语义。
+`ExtraHighBudgetThreshold` 是 Anthropic `enabled` thinking 从 `high` 切换到 `extra_high` 的阈值；大于阈值时使用 `extra_high`。`CarrierModelPatterns` 表示这些模型会把正文和工具协议承载在 `reasoning_content` 中，因此代理会重新分类；`NativeThinkingModelPatterns` 优先级更高，可把命中的模型强制恢复为原生 thinking 语义。`NativeThinkingWhenEnabledModelPatterns` 仅在客户端启用 thinking 时生效，未启用时仍保留 carrier 回退。
 
 模型 ID 为 `__max` 时，代理发送 `model_auto_selection.strategy=max`；`context_window_size` 仅使用模型目录明确给出的 `context_window_tokens.max`。普通 `__dev` 模型对应 `manual` 和目录中的 dev 窗口，不会把 DeepSeek-V4-Flash 的 112k/200k 硬套到其他模型。
 

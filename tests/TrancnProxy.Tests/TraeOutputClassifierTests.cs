@@ -82,6 +82,24 @@ public sealed class TraeOutputClassifierTests
     }
 
     [TestMethod]
+    public void ConditionalNativePresentation_OnlyAppliesWhenThinkingIsEnabled()
+    {
+        var settings = new ProxySettings.ReasoningSettings
+        {
+            CarrierModelPatterns = ["kimi"],
+            NativeThinkingModelPatterns = [],
+            NativeThinkingWhenEnabledModelPatterns = ["kimi-k3"]
+        };
+        var model = new TraeModelDescriptor(
+            "kimi-k3__max", "kimi-k3", "Kimi K3", TraeModelVariant.Max);
+
+        settings.ResolvePresentation(model, thinkingEnabled: true)
+            .Should().Be(TraeReasoningPresentation.NativeThinking);
+        settings.ResolvePresentation(model, thinkingEnabled: false)
+            .Should().Be(TraeReasoningPresentation.Carrier);
+    }
+
+    [TestMethod]
     public void ReasoningPreview_StopsBeforeDraftedCode()
     {
         var preview = new TraeReasoningPreview();

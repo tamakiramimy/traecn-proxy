@@ -412,7 +412,7 @@ app.MapPost("/v1/messages", async (HttpContext ctx) =>
     TraeModelDescriptor descriptor;
     try { descriptor = await lease.Client.ResolveModelAsync(model, ct); }
     catch (TraeModelNotFoundException) { return UnsupportedModel(model); }
-    var presentation = settings.Upstream.Reasoning.ResolvePresentation(descriptor);
+    var presentation = settings.Upstream.Reasoning.ResolvePresentation(descriptor, thinkingEnabled);
     var messages = ConvertAnthropicMessages(
         body,
         thinkingEnabled && presentation == TraeReasoningPresentation.NativeThinking);

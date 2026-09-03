@@ -78,6 +78,7 @@ public sealed class ProxySettings
         public int ExtraHighBudgetThreshold { get; set; } = TraeChatTuning.DefaultExtraHighBudgetThreshold;
         public string[] CarrierModelPatterns { get; set; } = ["glm", "kimi", "deepseek", "qwen"];
         public string[] NativeThinkingModelPatterns { get; set; } = [];
+        public string[] NativeThinkingWhenEnabledModelPatterns { get; set; } = ["kimi-k3"];
 
         internal int ValidatedBudgetThreshold()
         {
@@ -86,11 +87,15 @@ public sealed class ProxySettings
             return ExtraHighBudgetThreshold;
         }
 
-        internal TraeReasoningPresentation ResolvePresentation(TraeModelDescriptor model)
+        internal TraeReasoningPresentation ResolvePresentation(
+            TraeModelDescriptor model,
+            bool thinkingEnabled = false)
         {
             ArgumentNullException.ThrowIfNull(model);
             string identity = $"{model.Id}\n{model.ConfigName}\n{model.DisplayName}";
             if (Matches(identity, NativeThinkingModelPatterns))
+                return TraeReasoningPresentation.NativeThinking;
+            if (thinkingEnabled && Matches(identity, NativeThinkingWhenEnabledModelPatterns))
                 return TraeReasoningPresentation.NativeThinking;
             return Matches(identity, CarrierModelPatterns)
                 ? TraeReasoningPresentation.Carrier
