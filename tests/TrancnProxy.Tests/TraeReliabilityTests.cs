@@ -231,6 +231,46 @@ public sealed class TraeReliabilityTests
     }
 
     [TestMethod]
+    public void AnthropicResponsePolicy_RecoveryMessageBypassesRequiredToolGate()
+    {
+        TraeAnthropicResponsePolicy.ShouldBufferText(toolUseRequired: true, hasToolUse: false, isRecoveryMessage: false)
+            .Should().BeTrue();
+        TraeAnthropicResponsePolicy.ShouldBufferText(toolUseRequired: true, hasToolUse: false, isRecoveryMessage: true)
+            .Should().BeFalse();
+    }
+
+    [TestMethod]
+    public void AnthropicResponsePolicy_RequiredToolFailureExplainsMissingCall()
+    {
+        string message = TraeAnthropicResponsePolicy.ToolFailureMessage(
+            "Write",
+            TraeAnthropicResponsePolicy.RequiredToolMissingReason);
+
+        message.Should().Contain("required 'Write' tool");
+        message.Should().NotContain("invalid arguments");
+    }
+
+    [TestMethod]
+    public void AnthropicResponsePolicy_RetryBudgetsAreIndependentByFailureReason()
+    {
+        var retryCounts = new Dictionary<string, int>();
+
+        TraeAnthropicResponsePolicy.TryReserveRetry(
+            retryCounts, TraeAnthropicResponsePolicy.RequiredToolMissingReason).Should().BeTrue();
+        TraeAnthropicResponsePolicy.TryReserveRetry(
+            retryCounts, TraeAnthropicResponsePolicy.RequiredToolMissingReason).Should().BeTrue();
+        TraeAnthropicResponsePolicy.TryReserveRetry(
+            retryCounts, TraeAnthropicResponsePolicy.RequiredToolMissingReason).Should().BeTrue();
+        TraeAnthropicResponsePolicy.TryReserveRetry(
+            retryCounts, TraeAnthropicResponsePolicy.RequiredToolMissingReason).Should().BeFalse();
+
+        TraeAnthropicResponsePolicy.TryReserveRetry(
+            retryCounts, "missing required properties: file_path").Should().BeTrue();
+        TraeAnthropicResponsePolicy.TryReserveRetry(
+            retryCounts, "missing required properties: file_path").Should().BeFalse();
+    }
+
+    [TestMethod]
     public async Task ChatStreamAsync_RejectsUnrelatedActualModelUnlessAliasIsApproved()
     {
         const string upstream =

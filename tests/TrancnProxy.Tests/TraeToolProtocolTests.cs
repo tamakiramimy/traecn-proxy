@@ -139,6 +139,21 @@ public sealed class TraeToolProtocolTests
     }
 
     [TestMethod]
+    public void SelectRequiredTool_KeepsOnlyNamedDefinition()
+    {
+        var tools = new JsonArray(
+            new JsonObject { ["name"] = "Read", ["description"] = "read a file" },
+            new JsonObject { ["name"] = "Write", ["description"] = "write a file" },
+            new JsonObject { ["name"] = "Bash", ["description"] = "run a command" });
+
+        JsonArray selected = TraeToolProtocol.SelectRequiredTool(tools, "write")!;
+
+        selected.Should().ContainSingle();
+        selected[0]!["name"]!.GetValue<string>().Should().Be("Write");
+        tools.Should().HaveCount(3);
+    }
+
+    [TestMethod]
     public void PreferredExecutionTool_SelectsOutstandingReadAfterWriteCompletes()
     {
         var tools = new JsonArray(

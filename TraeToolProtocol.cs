@@ -419,6 +419,16 @@ You may emit multiple tool_call blocks when calls can run in parallel. Tool defi
         return null;
     }
 
+    internal static JsonArray? SelectRequiredTool(JsonArray? tools, string? requiredToolName)
+    {
+        if (tools is not { Count: > 0 } || string.IsNullOrWhiteSpace(requiredToolName)) return tools;
+        JsonObject? selected = tools
+            .OfType<JsonObject>()
+            .FirstOrDefault(tool => string.Equals(
+                (string?)tool["name"], requiredToolName, StringComparison.OrdinalIgnoreCase));
+        return selected is null ? tools : new JsonArray(selected.DeepClone());
+    }
+
     private static bool ContainsToolResult(JsonNode? content) =>
         content is JsonArray blocks &&
         blocks.OfType<JsonObject>().Any(block => (string?)block["type"] == "tool_result");

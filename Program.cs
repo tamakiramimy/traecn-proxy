@@ -670,9 +670,20 @@ List<(string role, string text)> ConvertAnthropicMessages(JsonObject body, bool 
     var tools = body["tools"] as JsonArray;
     JsonNode? toolChoice = body["tool_choice"];
     bool toolUseRequired = TraeToolProtocol.ShouldForceToolUse(body["messages"] as JsonArray, tools, toolChoice);
-    if (toolUseRequired)
+    string? requiredToolName = toolUseRequired
+        ? TraeToolProtocol.PreferredExecutionTool(body["messages"] as JsonArray, tools)
+        : null;
+    JsonArray? promptTools = tools;
+    if (toolUseRequired && requiredToolName is not null)
+    {
+        toolChoice = new JsonObject { ["type"] = "tool", ["name"] = requiredToolName };
+        promptTools = TraeToolProtocol.SelectRequiredTool(tools, requiredToolName);
+    }
+    else if (toolUseRequired)
+    {
         toolChoice = new JsonObject { ["type"] = "any" };
-    string system = TraeToolProtocol.BuildSystemPrompt(body["system"], tools, toolChoice, thinkingEnabled);
+    }
+    string system = TraeToolProtocol.BuildSystemPrompt(body["system"], promptTools, toolChoice, thinkingEnabled);
     if (!string.IsNullOrEmpty(system)) result.Add(("system", system));
     foreach (var m in body["messages"]?.AsArray() ?? new JsonArray())
     {
@@ -877,10 +888,10 @@ async Task<JsonObject> CollectAnthropic(
     var thinking = new StringBuilder();
     var transcript = new StringBuilder();
 
-    void AddText(string text)
+    void AddText(string text, bool isRecoveryMessage = false)
     {
         if (string.IsNullOrEmpty(text)) return;
-        if (toolUseRequired && !hasToolUse)
+        if (TraeAnthropicResponsePolicy.ShouldBufferText(toolUseRequired, hasToolUse, isRecoveryMessage))
         {
             transcript.Append(text);
             return;
@@ -929,7 +940,10 @@ async Task<JsonObject> CollectAnthropic(
             foreach (TraeOutputBlock block in blocks)
             {
                 if (block is TraeThinkingDeltaBlock thinkingDelta && thinkingEnabled)
+                {
                     thinking.Append(thinkingDelta.Text);
+                    if (toolUseRequired && !hasToolUse) transcript.Append(thinkingDelta.Text);
+                }
                 else if (block is TraeThinkingEndBlock)
                     FlushThinking();
                 else if (block is TraeTextBlock textBlock)
@@ -986,24 +1000,27 @@ async Task<JsonObject> CollectAnthropic(
         return completed;
     }
 
-    for (int attempt = 0; ; attempt++)
+    var retryCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+    for (;;)
     {
+        if (toolUseRequired && !hasToolUse) transcript.Clear();
         var failure = AppendResult(result);
         if (failure is null && hasAnswerContent && (!toolUseRequired || hasToolUse)) break;
         string reason = failure?.Reason ?? (toolUseRequired && !hasToolUse
-            ? "required tool was not called"
+            ? TraeAnthropicResponsePolicy.RequiredToolMissingReason
             : "no answer");
-        int maximumRetries = reason == "required tool was not called" ? 3 : 1;
-        if (attempt >= maximumRetries || retryUpstream is null)
+        if (retryUpstream is null || !TraeAnthropicResponsePolicy.TryReserveRetry(retryCounts, reason))
         {
             if (failure is { } invalid)
-                AddText(InvalidToolCallMessage(invalid.ToolName, invalid.Reason));
+                AddText(TraeAnthropicResponsePolicy.ToolFailureMessage(invalid.ToolName, invalid.Reason), isRecoveryMessage: true);
+            else if (toolUseRequired && !hasToolUse)
+                AddText(TraeAnthropicResponsePolicy.ToolFailureMessage(requiredToolName, reason), isRecoveryMessage: true);
             break;
         }
         string? toolName = failure?.ToolName ?? requiredToolName;
         Console.Error.WriteLine($"[retry] {model}: {reason}");
         result = await TraeChatResult.CollectAsync(
-            retryUpstream(reason == "required tool was not called" ? "" : transcript.ToString(), toolName, reason), ct);
+            retryUpstream(transcript.ToString(), toolName, reason), ct);
     }
 
     if (!hasAnswerContent)
@@ -1098,12 +1115,12 @@ async Task WriteAnthropicStream(
         blockType = null;
     }
 
-    async Task WriteBlock(TraeOutputBlock block, bool fromReasoning = false)
+    async Task WriteBlock(TraeOutputBlock block, bool fromReasoning = false, bool isRecoveryMessage = false)
     {
         if (block is TraeTextBlock textBlock)
         {
             if (string.IsNullOrEmpty(textBlock.Text)) return;
-            if (toolUseRequired && !sawToolUse)
+            if (TraeAnthropicResponsePolicy.ShouldBufferText(toolUseRequired, sawToolUse, isRecoveryMessage))
             {
                 transcript.Append(textBlock.Text);
                 provisionalTextLength += textBlock.Text.Length;
@@ -1134,7 +1151,7 @@ async Task WriteAnthropicStream(
                     if (reasoningPreview.Stopped && blockType == "thinking") await CloseBlock();
                 }
                 if (reasoningPreview.Stopped || provisionalTextLength >= TraeToolProtocol.RequiredToolDraftLimit)
-                    pendingRetry ??= (requiredToolName, "required tool was not called");
+                    pendingRetry ??= (requiredToolName, TraeAnthropicResponsePolicy.RequiredToolMissingReason);
                 return;
             }
             sawAnswerContent = true;
@@ -1166,7 +1183,7 @@ async Task WriteAnthropicStream(
                 pendingRetry ??= (toolUse.Name, validationError);
                 return;
             }
-            if (pendingRetry?.Reason == "required tool was not called") pendingRetry = null;
+            if (pendingRetry?.Reason == TraeAnthropicResponsePolicy.RequiredToolMissingReason) pendingRetry = null;
             await StartMessage();
             await CloseBlock();
             sawToolUse = true;
@@ -1193,25 +1210,10 @@ async Task WriteAnthropicStream(
         }
         else if (block is TraeToolUseStartBlock toolStart)
         {
-            if (pendingRetry?.Reason == "required tool was not called") pendingRetry = null;
+            if (pendingRetry?.Reason == TraeAnthropicResponsePolicy.RequiredToolMissingReason) pendingRetry = null;
             pendingToolId = toolStart.Id;
             pendingToolName = toolStart.Name;
             pendingToolInput.Clear();
-            // 参数可能有十几 KB，攒齐再开块会让客户端在整个生成期间只看得到思考。
-            await StartMessage();
-            await CloseBlock();
-            blockIndex++;
-            blockOpen = true;
-            blockType = "tool_use";
-            await WriteEvent("content_block_start", new JsonObject
-            {
-                ["type"] = "content_block_start", ["index"] = blockIndex,
-                ["content_block"] = new JsonObject
-                {
-                    ["type"] = "tool_use", ["id"] = toolStart.Id,
-                    ["name"] = toolStart.Name, ["input"] = new JsonObject()
-                }
-            });
         }
         else if (block is TraeToolInputDeltaBlock toolDelta && pendingToolName is not null)
         {
@@ -1230,7 +1232,6 @@ async Task WriteAnthropicStream(
             {
                 LogRejectedToolCall(name, "arguments are not valid JSON", serializedInput);
                 pendingRetry ??= (name, "arguments are not valid JSON");
-                await CloseBlock();
                 return;
             }
             var candidate = new TraeToolUseBlock(id, name, input);
@@ -1238,12 +1239,24 @@ async Task WriteAnthropicStream(
             {
                 LogRejectedToolCall(name, endError, input.ToJsonString());
                 pendingRetry ??= (name, endError);
-                await CloseBlock();
                 return;
             }
 
+            if (pendingRetry?.Reason == TraeAnthropicResponsePolicy.RequiredToolMissingReason) pendingRetry = null;
             sawToolUse = true;
             sawAnswerContent = true;
+            await StartMessage();
+            await CloseBlock();
+            blockIndex++;
+            await WriteEvent("content_block_start", new JsonObject
+            {
+                ["type"] = "content_block_start", ["index"] = blockIndex,
+                ["content_block"] = new JsonObject
+                {
+                    ["type"] = "tool_use", ["id"] = id,
+                    ["name"] = name, ["input"] = new JsonObject()
+                }
+            });
             await WriteEvent("content_block_delta", new JsonObject
             {
                 ["type"] = "content_block_delta", ["index"] = blockIndex,
@@ -1252,7 +1265,7 @@ async Task WriteAnthropicStream(
                     ["type"] = "input_json_delta", ["partial_json"] = input.ToJsonString()
                 }
             });
-            await CloseBlock();
+            await WriteEvent("content_block_stop", new JsonObject { ["type"] = "content_block_stop", ["index"] = blockIndex });
         }
         else if (block is TraeToolCallFailureBlock failure)
         {
@@ -1275,6 +1288,7 @@ async Task WriteAnthropicStream(
         else if (block is TraeThinkingDeltaBlock thinkingDelta && blockType == "thinking" && thinkingEnabled)
         {
             if (string.IsNullOrEmpty(thinkingDelta.Text)) return;
+            if (toolUseRequired && !sawToolUse) transcript.Append(thinkingDelta.Text);
             await WriteEvent("content_block_delta", new JsonObject
             {
                 ["type"] = "content_block_delta", ["index"] = blockIndex,
@@ -1293,6 +1307,7 @@ async Task WriteAnthropicStream(
         classifier = new TraeOutputClassifier(presentation, streamToolCalls: true, tools: tools);
         reasoningPreview = new TraeReasoningPreview();
         provisionalTextLength = 0;
+        if (toolUseRequired && !sawToolUse) transcript.Clear();
         await foreach (var ev in TraeStreamHeartbeat.ReadAsync(
             source,
             cancellationToken => new ValueTask(WriteEvent("ping", new JsonObject { ["type"] = "ping" })),
@@ -1332,7 +1347,7 @@ async Task WriteAnthropicStream(
                 if (pendingRetry is not null) return false;
                 if (toolUseRequired && !sawToolUse)
                 {
-                    pendingRetry = (requiredToolName, "required tool was not called");
+                    pendingRetry = (requiredToolName, TraeAnthropicResponsePolicy.RequiredToolMissingReason);
                     return false;
                 }
                 if (!sawAnswerContent)
@@ -1355,29 +1370,24 @@ async Task WriteAnthropicStream(
         await WriteEvent("ping", new JsonObject { ["type"] = "ping" });
 
         bool completed = await RunAttempt(upstream);
-        int retryCount = 0;
-        while (!completed && retryUpstream is not null && pendingRetry is { } failed)
+        var retryCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        while (!completed && retryUpstream is not null && pendingRetry is { } failed && failed.Reason is { } failedReason)
         {
-            int maximumRetries = failed.Reason == "required tool was not called" ? 3 : 1;
-            if (retryCount >= maximumRetries) break;
+            if (!TraeAnthropicResponsePolicy.TryReserveRetry(retryCounts, failedReason)) break;
             pendingRetry = null;
-            Console.Error.WriteLine($"[retry] {model}: {failed.Reason}");
-            retryCount++;
+            Console.Error.WriteLine($"[retry] {model}: {failedReason}");
             completed = await RunAttempt(retryUpstream(
-                failed.Reason == "required tool was not called" ? "" : transcript.ToString(),
+                transcript.ToString(),
                 failed.ToolName,
-                failed.Reason));
+                failedReason));
         }
         if (!completed && pendingRetry is { } unrecovered)
         {
             pendingRetry = null;
-            if (unrecovered.ToolName is { } toolName && unrecovered.Reason is { } reason)
-                await WriteBlock(new TraeTextBlock(InvalidToolCallMessage(toolName, reason)));
-            else
-            {
-                await CloseBlock();
-                throw new TraeUpstreamException("Trae 上游连续两次未按要求调用工具。");
-            }
+            if (unrecovered.Reason is { } reason)
+                await WriteBlock(
+                    new TraeTextBlock(TraeAnthropicResponsePolicy.ToolFailureMessage(unrecovered.ToolName, reason)),
+                    isRecoveryMessage: true);
         }
 
         await CloseBlock();
@@ -1409,9 +1419,6 @@ async Task WriteAnthropicStream(
     }
 }
 
-string InvalidToolCallMessage(string toolName, string error) =>
-    $"The tool call '{toolName}' was not executed because the model returned invalid arguments ({error}). Please retry the request.";
-
 // 模型输出不可重现，拒绝时必须留下载荷片段才能事后定位格式问题。
 void LogRejectedToolCall(string toolName, string error, string payload)
 {
@@ -1428,9 +1435,9 @@ List<(string role, string text)> ToolRetryMessages(List<(string role, string tex
 
     var retry = new List<(string role, string text)>(messages);
     if (!string.IsNullOrWhiteSpace(assistantPartial)) retry.Add(("assistant", assistantPartial));
-        retry.Add(("user", reason == "required tool was not called"
-                ? "Your previous attempt failed because you drafted the requested content as prose instead of calling a tool. " +
-                    "Do not plan, explain, preview, or repeat the content. Your entire next response MUST be exactly one tool call " +
+        retry.Add(("user", reason == TraeAnthropicResponsePolicy.RequiredToolMissingReason
+                ? "The preceding assistant message already completed the reasoning for this task. Do not reason, plan, explain, preview, or repeat it again. " +
+                    "Your entire next response MUST begin immediately with exactly one tool call " +
                     (toolName is null ? "using the required execution tool. " : $"using the '{toolName}' tool. ") +
                     "Start immediately with <tool_call and put the real complete content only inside that tool call."
                 : toolName is null
